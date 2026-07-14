@@ -1,0 +1,2559 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.0" snapToGrid="false">
+  <code><![CDATA[;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; STIGMERGY + MUTUALISM IN SOCIO-TECHNICAL SYSTEMS  (STiMUS)
+;; NetLogo 7 — version 2.1
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; VERSION 2.1 — CHANGELOG / NOTES
+;; ----------------------------------
+;; v2.1 builds on v2. The v2 structural separation of stigmergy and
+;; mutualism is preserved unchanged; v2.1 fixes the one remaining
+;; weakness surfaced by the v2 diagnostics and adds reporters that make
+;; the explicit-assignment channel measurable.
+;;
+;; Terminology: MUTUALISM — the mutualistic relationship between
+;; contributors and artefact-objects (contributors enrich artefacts;
+;; artefacts return benefit that fuels contributor motivation). This is
+;; contributor–artefact mutualism, not merely contributor–contributor
+;; relations. The term "mutualism" is used throughout.
+;;
+;; -------------------------------------------------------------------
+;; (A) PRESERVED FROM v2 (no change)
+;; -------------------------------------------------------------------
+;;  (1) resource-value is NOT part of the ACO target-selection weight.
+;;      Stigmergy decides WHERE to work (pheromone, incompleteness,
+;;      maintenance-need, task flag, topic match); mutualism decides
+;;      WITH WHAT EFFORT (resource-value → benefit → motivation →
+;;      edit-power → quality). Confirmed by E3 on v2: mutualism no
+;;      longer hurts quality (v1 t=10.88, p<0.0001 → v2 n.s.).
+;;  (2) task-priority-bonus = 1.25 in the ACO weight for is-task? patches.
+;;  (3) specialization-weight = 0.60; topic-match-bonus = 0.50.
+;;  (4) All v2 diagnostic reporters (mean-motivation, benefit-gain-per-edit,
+;;      mutualism-index-norm, edits-on-tasks, edits-on-non-tasks,
+;;      task-edit-share, resource-edit-correlation).
+;;
+;; -------------------------------------------------------------------
+;; (B) NEW IN v2.1 — task-focused explicit assignment
+;; -------------------------------------------------------------------
+;;  (5) In explicit mode the candidate set is now ONLY task patches:
+;;        candidates = visible with [is-task?]
+;;      Previously the filter also admitted high-maintenance and
+;;      incomplete non-task patches, so even at p-explicit = 1 only
+;;      ~4% of edits landed on tasks (E1, v2). Now explicit mode means
+;;      "if I can see a formal task, I work on it."
+;;      If NO task is visible, the contributor falls back to the
+;;      stigmergic rule (aco-choose-patch) and explicit-mode? is set to
+;;      false, so the explicit-bonus is not applied to a stigmergic
+;;      choice. We deliberately do NOT fall back to "do nothing", because
+;;      that would turn p-explicit into an activity-suppression parameter
+;;      and confound E1 with activity-probability and total-edits.
+;;      Selection among visible tasks is by (task-complexity +
+;;      (1 - completeness)) — hardest unfinished task first.
+;;
+;; -------------------------------------------------------------------
+;; (C) NEW IN v2.1 — explicit-channel diagnostics (measurement only)
+;; -------------------------------------------------------------------
+;;  (6) explicit-attempts-count  — times a contributor entered the
+;;      p-explicit branch.
+;;  (7) explicit-edits-count     — times explicit mode actually selected
+;;      a visible task and the edit was performed.
+;;  (8) explicit-fallback-count  — times explicit mode found no visible
+;;      task and fell back to stigmergy.
+;;  (9) explicit-edit-share      — explicit-edits-count / total-edits.
+;;      The share of edits that were genuinely task-assigned.
+;; (10) explicit-hit-rate        — explicit-edits-count / explicit-attempts-count.
+;;      How often an explicit attempt actually found a task.
+;; (11) explicit-fallback-rate   — explicit-fallback-count / explicit-attempts-count.
+;;
+;; These let us tell whether a change in task-completion is due to
+;; explicit assignment actually hitting tasks, or to stigmergic fallback
+;; doing the work. Without them, v2's task-edit-share (~4%) was
+;; uninterpretable.
+;;
+;; -------------------------------------------------------------------
+;; WHAT IS PRESERVED FROM v1 (unchanged)
+;; -------------------------------------------------------------------
+;;  - All 11 interface sliders (num-contributors … activity-probability).
+;;  - Formulas for edit-power, local-benefit, pheromone dynamics.
+;;  - All v1 reporters (page-diversity, gini-edits, non-task-active-pages,
+;;    the fixed task-completion-rate, etc.).
+;;  - Default behaviour reproduces v2 except for the deliberately
+;;    changed explicit-mode filter (5); therefore v2.1 runs are NOT
+;;    seed-identical to v2 — this is expected and desirable.
+;;
+;; -------------------------------------------------------------------
+;; OPEN QUESTIONS (not implemented, flagged only)
+;; -------------------------------------------------------------------
+;;  (Q1) Dynamic vision-radius, scaled with shared-mental-model.
+;;  (Q2) lambda-smm weighted by the quality of the target artefact.
+;;  (Q3) ESR in a sliding window (ring buffer).
+;;  (Q4) Two ESR metrics (event-level global ESR and patch-level esr-value)
+;;       coexist — documented, not unified.
+;;  (Q5) edit-authors stores unique authors, not chronology.
+;;  (Q6) Individual activity-rate (for genuine participation inequality).
+;;  (Q7) A was-task? patch variable to distinguish "edited patches that
+;;       were never tasks" from "edited patches whose task is complete".
+;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+globals [
+  total-edits            ; cumulative count of all edit events
+  cross-author-edits     ; cumulative count of edits where the previous editor differed
+  ESR                    ; event-level Edit Succession Ratio = cross-author-edits / total-edits
+  mean-quality           ; mean patch quality
+  mean-resource-value    ; mean patch resource-value
+  mutualism-index        ; (mean contributor benefit-gain + mean-resource-value) / 2
+  coediting-density      ; density of the co-editing network
+  active-pages-share     ; share of patches with at least one edit
+  edge-log               ; bipartite edit log: list of (tick, who, pageid, specialty, topic-tag, quality)
+  initial-task-count     ; v1 — number of patches flagged is-task? at setup (for task-completion-rate)
+  tasks-completed        ; v1 — running count of tasks that have reached the completion threshold
+  edits-on-tasks-count   ; v2 — running count of edits on active (is-task?) patches
+  explicit-attempts-count ; v2.1 — times a contributor entered the p-explicit branch
+  explicit-edits-count   ; v2.1 — times explicit mode actually selected and edited a visible task
+  explicit-fallback-count ; v2.1 — times explicit mode found no visible task and fell back to stigmergy
+]
+
+breed [contributors contributor]
+undirected-link-breed [coedits coedit]
+
+patches-own [
+  pheromone          ; stigmergic trace intensity; diffuses and evaporates
+  quality            ; content quality in [0,1]
+  completeness       ; task/content completion in [0,1]
+  recentness         ; ticks since last edit (initialised to 9999)
+  last-editor-id     ; who of the most recent editor, or -1
+  edit-count         ; total edits received
+  edit-authors       ; list of UNIQUE authors (deduplicated, not a full history)
+  is-task?           ; is this patch a designated task?
+  task-complexity    ; complexity in [0,1]
+  resource-value     ; mutualistic benefit available to visitors in [0,1]
+  reuse-count        ; number of reuse/edit events
+  maintenance-need   ; degradation accumulator in [0,1]; grows when unattended
+  topic-tag          ; domain index in [0, topic-count-1]
+]
+
+contributors-own [
+  skill                  ; competence in [0.3,1.0]
+  motivation             ; engagement in [0.05,1.0]; updated over time
+  shared-mental-model    ; proxy for team shared understanding in [0,1]
+  specialty              ; preferred topic index in [0, topic-count-1]
+  my-last-page           ; last edited patch or nobody
+  my-edit-count          ; contributor's total edits
+  benefit-gain           ; cumulative benefit obtained from artefacts
+  explicit-mode?         ; did the current step use explicit task assignment?
+]
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; fixed internal parameters
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Exponent on the pheromone factor in the ACO-style target weight.
+; Larger than beta-heuristic, so "recent activity" attracts more than "mere incompleteness".
+to-report alpha-pheromone
+  report 1.6
+end
+
+; Exponent on the (1 - completeness) factor in the ACO-style target weight.
+to-report beta-heuristic
+  report 1.3
+end
+
+; v2 — Multiplicative bonus applied to the target weight when the patch topic
+; matches the contributor's specialty. Raised 0.35 → 0.60 so that topics
+; become a meaningful lever (E5 showed zero effect at 0.35).
+to-report specialization-weight
+  report 0.60
+end
+
+; v2 — Multiplicative bonus on edit-power when the patch topic matches specialty.
+; Raised 0.30 → 0.50 (in parallel with specialization-weight) so that
+; specialisation affects not only target choice but also edit power.
+to-report topic-match-bonus
+  report 0.50
+end
+
+; Multiplicative bonus on edit-power when the contributor is in explicit mode.
+to-report explicit-effect
+  report 0.10
+end
+
+; Logistic gain coefficient for quality per edit: q + factor*power*(1 - q).
+to-report quality-gain-factor
+  report 0.08
+end
+
+; Logistic gain coefficient for completeness per edit.
+to-report completeness-gain-factor
+  report 0.05
+end
+
+; Reduction of maintenance-need per edit, scaled by edit-power.
+to-report maintenance-relief-factor
+  report 0.08
+end
+
+; Per-tick drift of maintenance-need on every patch.
+to-report maintenance-drift
+  report 0.010
+end
+
+; Per-tick decay of resource-value, proportional to maintenance-need.
+to-report resource-decay
+  report 0.003
+end
+
+; Motivation recovery rate, proportional to local benefit drawn from the artefact.
+to-report motivation-recovery
+  report 0.03
+end
+
+; Fixed motivation fatigue subtracted every edit.
+to-report motivation-fatigue
+  report 0.005
+end
+
+; Weight of resource-value in the local-benefit formula.
+to-report resource-benefit-weight
+  report 0.40
+end
+
+; Weight of quality in the local-benefit formula.
+to-report quality-benefit-weight
+  report 0.20
+end
+
+; Weight of topic match in the local-benefit formula.
+to-report topic-benefit-weight
+  report 0.30
+end
+
+; Completeness threshold above which a task is considered complete.
+to-report task-completion-threshold
+  report 0.90
+end
+
+; v2 — Task priority bonus in stigmergic target selection.
+; Formal tasks (is-task? = true) receive this multiplier in the ACO weight
+; so they are not "starved" in stigmergic mode (E1: task-completion fell as
+; p-explicit rose, because is-task? was not part of the target weight).
+; The value 1.25 is moderate: tasks are visible as affordances but do not
+; overwhelm pheromone / completeness / need.
+to-report task-priority-bonus
+  report 1.25
+end
+
+; v1 — Number of DISTINCT contributor-page pairs in the edge log
+; (not the number of log rows, which counts repeated edits on the same pair).
+to-report bigraph-edges
+  report length remove-duplicates
+    map [[e1] -> (list (item 1 e1) (item 2 e1))] edge-log
+end
+
+; Number of patches that have been edited at least once.
+to-report active-pages
+  report count patches with [edit-count > 0]
+end
+
+; Number of contributors that have edited at least once.
+to-report active-authors
+  report count contributors with [my-edit-count > 0]
+end
+
+; v1 — Number of edited patches that are NOT current tasks.
+; Named reporter for the BehaviourSpace expression
+; count patches with [not is-task? and edit-count > 0].
+; NOTE: completed tasks (is-task? set to false on completion) ARE
+; counted here, matching the original BehaviourSpace expression.
+; If you want "edited patches that were NEVER tasks", a patch
+; variable such as was-task? would be needed (open question Q7).
+to-report non-task-active-pages
+  report count patches with [not is-task? and edit-count > 0]
+end
+
+; Patch-level Edit Succession Ratio: share of edited patches whose
+; edit-authors list contains more than one unique author.
+; NOTE: this is NOT the same as the global ESR (event-level).
+to-report esr-value
+  let edited patches with [edit-count > 0]
+  if not any? edited [ report 0 ]
+  report (count edited with [length remove-duplicates edit-authors > 1]) /
+         count edited
+end
+
+; Alias for the global mutualism-index (kept for interface/plot convenience).
+to-report mutualism-idx
+  report mutualism-index
+end
+
+; v1 — Page diversity: normalised Shannon entropy of the edit-count
+; distribution across the patches that have been edited.
+;   0 = all edits concentrated on a single patch
+;   1 = edits perfectly evenly spread across active patches
+; Normalised by ln(active-pages), so the reference set is "edited pages".
+; REVIEW: if comparability across runs with different world sizes is
+; needed, normalise by ln(count patches) instead.
+to-report page-diversity
+  let edited patches with [edit-count > 0]
+  let k count edited
+  if total-edits = 0 or k <= 1 [ report 0 ]
+  let h 0
+  ask edited [
+    let p edit-count / total-edits
+    set h h - (p * ln p)
+  ]
+  report h / ln k
+end
+
+; v1 — Gini coefficient of my-edit-count across ALL contributors
+; (including zero-edit contributors), measuring participation inequality.
+; 0 = perfectly equal participation; approaches 1 as participation
+; concentrates on a single contributor (finite-sample max is
+; (n - 1) / n, i.e. 0.95 for 20 contributors).
+; NOTE: with the default tick structure (every contributor acts every
+; tick) this stays near 0. It becomes informative when
+; activity-probability < 1 or when some contributors are starved of
+; visible patches.
+to-report gini-edits
+  if not any? contributors [ report 0 ]
+  let xs sort [my-edit-count] of contributors
+  let n length xs
+  if n = 0 [ report 0 ]
+  let total sum xs
+  if total = 0 [ report 0 ]
+  let weighted-sum 0
+  let i 1
+  foreach xs [ x ->
+    set weighted-sum weighted-sum + (i * x)
+    set i i + 1
+  ]
+  report ((2 * weighted-sum) / (n * total)) - ((n + 1) / n)
+end
+
+;; ===========================================================
+;; v2 — DIAGNOSTIC REPORTERS (measurement only, dynamics unchanged)
+;; ===========================================================
+
+; v2 — Mean motivation of contributors. Shows whether the channel
+; resource-value → benefit → motivation → edit-power works. If mutualism
+; is enabled, mean-motivation should rise with mutualism-gain-factor.
+to-report mean-motivation
+  if not any? contributors [ report 0 ]
+  report mean [motivation] of contributors
+end
+
+; v2 — Normalised return: benefit-gain / my-edit-count.
+; Unlike the cumulative mutualism-index, it is comparable across runs of
+; different length. It rises when artefacts become "richer" and each edit
+; brings more benefit.
+to-report benefit-gain-per-edit
+  let active contributors with [my-edit-count > 0]
+  if not any? active [ report 0 ]
+  report mean [benefit-gain / my-edit-count] of active
+end
+
+; v2 — Normalised mutualism index:
+;   (mean benefit-gain-per-edit + mean-resource-value) / 2.
+; Comparable across runs of different length, unlike the cumulative
+; mutualism-index (which grows with the number of edits).
+to-report mutualism-index-norm
+  report (benefit-gain-per-edit + mean [resource-value] of patches) / 2
+end
+
+; v2 — Number of edits on formal tasks (counted in perform-edit).
+; Note: is-task? is reset on completion, so edits on already-completed
+; tasks are not counted here — this is "edits on active tasks".
+to-report edits-on-tasks
+  report edits-on-tasks-count
+end
+
+; v2 — Number of edits on non-task patches (including completed tasks,
+; since their is-task? is already false).
+to-report edits-on-non-tasks
+  report total-edits - edits-on-tasks-count
+end
+
+; v2 — Share of edits going onto active formal tasks.
+; A low share means the team is working past its tasks.
+to-report task-edit-share
+  if total-edits = 0 [ report 0 ]
+  report edits-on-tasks-count / total-edits
+end
+
+; v2 — Pearson correlation between resource-value and edit-count across
+; patches. A direct test of the preferential-attachment hypothesis: in v1
+; it was high (resource-value attracted edits); after the v2 fix it
+; should drop closer to 0 (and be exactly 0 when mutualism is off,
+; because resource-value then decays to 0 everywhere).
+to-report resource-edit-correlation
+  let edited patches with [edit-count > 0]
+  if count edited < 2 [ report 0 ]
+
+  let pairs [ (list resource-value edit-count) ] of edited
+  let rvs map [pair -> item 0 pair] pairs
+  let ecs map [pair -> item 1 pair] pairs
+
+  let mr mean rvs
+  let me mean ecs
+
+  let ss-r sum (map [pair -> (((item 0 pair) - mr) ^ 2)] pairs)
+  let ss-e sum (map [pair -> (((item 1 pair) - me) ^ 2)] pairs)
+
+  if (ss-r = 0) or (ss-e = 0) [ report 0 ]
+
+  let num sum (map [pair -> (((item 0 pair) - mr) * ((item 1 pair) - me))] pairs)
+  let den sqrt (ss-r * ss-e)
+
+  report num / den
+end
+
+;; ===========================================================
+;; v2.1 — EXPLICIT-CHANNEL DIAGNOSTIC REPORTERS (measurement only)
+;; ===========================================================
+
+; v2.1 — Share of edits that were genuinely task-assigned (the contributor
+; entered explicit mode AND found a visible task AND edited it). In v2.1
+; this should rise sharply with p-explicit, unlike v2's task-edit-share
+; which stayed near 4%.
+to-report explicit-edit-share
+  if total-edits = 0 [ report 0 ]
+  report explicit-edits-count / total-edits
+end
+
+; v2.1 — Of all explicit attempts, the fraction that actually found a
+; visible task. Low values mean formal tasks are often out of sight
+; (vision-radius too small or tasks already completed), so explicit
+; assignment keeps falling back to stigmergy.
+to-report explicit-hit-rate
+  if explicit-attempts-count = 0 [ report 0 ]
+  report explicit-edits-count / explicit-attempts-count
+end
+
+; v2.1 — Of all explicit attempts, the fraction that found NO visible task
+; and fell back to stigmergic choice. Complements explicit-hit-rate.
+to-report explicit-fallback-rate
+  if explicit-attempts-count = 0 [ report 0 ]
+  report explicit-fallback-count / explicit-attempts-count
+end
+
+; v2.1 — Number of patches still flagged as active tasks.
+; Distinguishes "explicit fallback because no task is visible" from
+; "fallback because all tasks are already completed": if this hits 0
+; early in a run, later explicit attempts will fall back to stigmergy
+; even though the assignment mechanism works perfectly.
+to-report active-task-count
+  report count patches with [is-task?]
+end
+
+; Return the full bipartite edit log as a CSV string (header + rows).
+to-report edge-log-csv
+  let header "tick,author_id,pageid,specialty,topic_tag,quality\n"
+  let rows map [[e1] ->
+    (word (item 0 e1) "," (item 1 e1) "," (item 2 e1) ","
+          (item 3 e1) "," (item 4 e1) "," (precision (item 5 e1) 4))
+  ] edge-log
+
+  if empty? rows [ report header ]
+
+  report (word header (reduce [[a b] -> (word a "\n" b)] rows))
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; setup
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Initialise the world: clear everything, reset globals and the edit
+; log, then create patches and contributors. The v1 counters
+; (initial-task-count, tasks-completed), the v2 counter
+; (edits-on-tasks-count) and the v2.1 counters (explicit-*) are reset here.
+to setup
+  clear-all
+  set total-edits 0
+  set cross-author-edits 0
+  set ESR 0
+  set mean-quality 0
+  set mean-resource-value 0
+  set mutualism-index 0
+  set coediting-density 0
+  set active-pages-share 0
+  set edge-log []
+  set initial-task-count 0      ; v1
+  set tasks-completed 0         ; v1
+  set edits-on-tasks-count 0   ; v2
+  set explicit-attempts-count 0  ; v2.1
+  set explicit-edits-count 0     ; v2.1
+  set explicit-fallback-count 0  ; v2.1
+  setup-patches
+  setup-contributors
+  reset-ticks
+end
+
+; Initialise every patch's stigmergic and mutualistic state, then flag
+; num-tasks patches as tasks. v1: record initial-task-count so that
+; task-completion-rate has the correct denominator.
+to setup-patches
+  ask patches [
+    set pheromone 0
+    set quality random-float 0.15
+    set completeness random-float 0.20
+    set recentness 9999
+    set last-editor-id -1
+    set edit-count 0
+    set edit-authors []
+    set is-task? false
+    set task-complexity random-float 1
+    set resource-value 0.2 + random-float 0.2
+    set reuse-count 0
+    set maintenance-need random-float 0.3
+    set topic-tag random topic-count
+    recolor-patch
+  ]
+
+  ask n-of num-tasks patches [
+    set is-task? true
+    set task-complexity 0.4 + random-float 0.6
+    set pcolor orange
+  ]
+  ; v1 — count actual flagged patches (robust if num-tasks > patch count).
+  set initial-task-count count patches with [is-task?]
+end
+
+; Create num-contributors agents with random initial state placed at
+; random positions. All start in stigmergic (green) mode.
+to setup-contributors
+  create-contributors num-contributors [
+    setxy random-xcor random-ycor
+    set shape "person"
+    set size 1.2
+    set color green
+    set skill 0.3 + random-float 0.7
+    set motivation 0.4 + random-float 0.6
+    set shared-mental-model 0.1 + random-float 0.1
+    set specialty random topic-count
+    set my-last-page nobody
+    set my-edit-count 0
+    set benefit-gain 0
+    set explicit-mode? false
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; main loop
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; One tick = one "session". Every contributor (subject to
+; activity-probability, v1) chooses a target, moves to it and edits it.
+; Afterwards the environment is updated globally: pheromone diffuses
+; and evaporates, artefacts age and degrade, then metrics are recomputed.
+to go
+  if not any? contributors [ stop ]
+
+  ask contributors [
+    ; v1 — probabilistic activation. At activity-probability = 1.0
+    ; (default) the fast path is taken WITHOUT consuming a random
+    ; number, so the original random stream is preserved and runs are
+    ; seed-identical to the previous validated release.
+    ifelse activity-probability >= 1 [
+      step-contributor
+    ] [
+      if random-float 1 < activity-probability [
+        step-contributor
+      ]
+    ]
+  ]
+
+  diffuse pheromone diffusion-rate
+
+  ask patches [
+    set pheromone pheromone * (1 - evaporation-rate)
+    if pheromone < 0 [ set pheromone 0 ]
+    set recentness recentness + 1
+    set maintenance-need min (list 1 (maintenance-need + maintenance-drift))
+    set resource-value max (list 0 (resource-value - resource-decay * maintenance-need))
+    recolor-patch
+  ]
+
+  update-metrics
+  tick
+end
+
+; A single contributor cycle: choose a target patch, move to it, edit it.
+to step-contributor
+  let target choose-target-page
+  if target != nobody [
+    move-to target
+    perform-edit target
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; choice logic
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Decide which patch the contributor will work on this tick.
+; With probability p-explicit it enters explicit (assigned-task) mode:
+;   v2.1 — candidates are ONLY visible task patches (is-task?). If any
+;   are visible, pick the hardest unfinished one. If NO task is visible,
+;   fall back to the stigmergic rule (aco-choose-patch) and clear
+;   explicit-mode? so the explicit-bonus is not applied. This makes
+;   "explicit mode" genuinely mean "I was assigned to and found a task";
+;   previously the wide filter let non-task patches leak in and only
+;   ~4% of explicit-mode edits landed on tasks.
+; Otherwise (probability 1 - p-explicit) it uses the stigmergic ACO rule.
+; REVIEW (Q1): vision-radius is constant for all contributors. One could
+;   scale it with shared-mental-model so well-integrated contributors
+;   see more. Not enabled by default.
+to-report choose-target-page
+  let visible patches in-radius vision-radius
+  if not any? visible [ report nobody ]
+
+  ifelse random-float 1 < p-explicit [
+    ; v2.1 — entered the explicit branch (an "attempt")
+    set explicit-attempts-count explicit-attempts-count + 1
+    let task-candidates visible with [is-task?]
+    ifelse any? task-candidates [
+      set explicit-mode? true
+      set color yellow
+      report max-one-of task-candidates [task-complexity + (1 - completeness)]
+    ] [
+      ; v2.1 — no visible task: fall back to stigmergy, do NOT apply the
+      ; explicit bonus. We avoid "do nothing" so p-explicit does not
+      ; become an activity-suppression parameter.
+      set explicit-fallback-count explicit-fallback-count + 1
+      set explicit-mode? false
+      set color green
+      report aco-choose-patch visible
+    ]
+  ] [
+    set explicit-mode? false
+    set color green
+    report aco-choose-patch visible
+  ]
+
+end
+
+; Stigmergic target choice: among visible patches that are still worth
+; working on (incomplete or in need of maintenance), pick the one that
+; maximises the ACO-style weight
+;   (pheromone+0.01)^alpha * (1-completeness+0.01)^beta
+;   * (1 + maintenance-need) * task-factor * topic-match-factor.
+; v2: resource-value REMOVED from the weight (previously 1 + resource-value +
+;   maintenance-need). Now stigmergy decides only WHERE to work — by
+;   pheromone, incompleteness and maintenance need; resource-value no
+;   longer attracts edits to mature artefacts. Mutualism acts separately,
+;   through benefit→motivation→edit-power.
+; v2: added task-priority-bonus for is-task? patches.
+; Selection is deterministic (max-one-of), not a probabilistic roulette.
+to-report aco-choose-patch [candidate-patches]
+  let weighted-patches candidate-patches with [completeness < 1 or maintenance-need > 0.05]
+  if not any? weighted-patches [ report one-of candidate-patches ]
+
+  report max-one-of weighted-patches
+  [
+    ((pheromone + 0.01) ^ alpha-pheromone) *
+    (((1 - completeness) + 0.01) ^ beta-heuristic) *
+    (1 + maintenance-need) *
+    (ifelse-value is-task? [task-priority-bonus] [1]) *
+    (ifelse-value (topic-tag = [specialty] of myself)
+      [1 + specialization-weight]
+      [1])
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; editing
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Apply one edit to the target patch and update the editor's state and
+; the co-editing network. Three processes happen together: the artefact
+; changes, the shared mental model / co-editing link grows, and the
+; contributor's benefit/motivation is updated.
+to perform-edit [target]
+  let previous-editor-id [last-editor-id] of target
+  let previous-authors [edit-authors] of target
+  let target-was-task? [is-task?] of target   ; v2 — capture before editing (is-task? may flip to false)
+  let topic-match ifelse-value ([topic-tag] of target = specialty) [1] [0]
+  let explicit-bonus ifelse-value explicit-mode? [explicit-effect] [0]
+  let edit-power skill * (0.5 + 0.5 * motivation) * (1 + topic-match * topic-match-bonus + explicit-bonus)
+
+  ; v2.1 — if this edit was made in explicit mode, the explicit channel
+  ; actually hit a task. Count it (only happens when a visible task was
+  ; selected in choose-target-page; explicit-mode? is cleared on fallback).
+  if explicit-mode? [
+    set explicit-edits-count explicit-edits-count + 1
+  ]
+
+  ; --- 4a. Change the artefact (stigmergic + mutualistic layers) ---
+  ask target [
+    set pheromone pheromone + edit-increment
+    set quality min (list 1 (quality + quality-gain-factor * edit-power * (1 - quality)))
+    set completeness min (list 1 (completeness + completeness-gain-factor * edit-power * (1 - completeness)))
+    set recentness 0
+    set edit-count edit-count + 1
+    set reuse-count reuse-count + 1
+    set resource-value min (list 1 (resource-value + mutualism-gain-factor * edit-power * (1 - resource-value)))
+    set maintenance-need max (list 0 (maintenance-need - maintenance-relief-factor * edit-power))
+    set edit-authors remove-duplicates lput [who] of myself edit-authors
+    set last-editor-id [who] of myself
+    ; v1 — increment tasks-completed exactly once when a task crosses the
+    ; threshold. Setting is-task? false prevents double counting.
+    if is-task? and completeness >= task-completion-threshold [
+      set is-task? false
+      set tasks-completed tasks-completed + 1   ; v1
+    ]
+  ]
+
+  ; --- 4b. Shared mental model and co-editing links ---
+  ; If the previous editor was a different contributor, this is a
+  ; cross-author succession: count it, grow SMM, and link the two editors.
+  ; REVIEW (Q2): lambda-smm is constant; one could weight it by target
+  ;   quality (lambda-smm * [quality] of target) to model how much
+  ;   context the previous edit transmitted. Not enabled by default.
+  if previous-editor-id >= 0 and previous-editor-id != who [
+    set cross-author-edits cross-author-edits + 1
+    set shared-mental-model min (list 1 (shared-mental-model + lambda-smm))
+    let prev-agent turtle previous-editor-id
+    if prev-agent != nobody and prev-agent != self [
+      if not link-neighbor? prev-agent [
+        create-coedit-with prev-agent [
+          set color gray
+          set thickness 0.1
+        ]
+      ]
+    ]
+  ]
+
+  ; Link the editor to every other prior author of this artefact too,
+  ; so the co-editing network reflects shared work, not only succession.
+  if length previous-authors > 0 [
+    let other-authors remove who previous-authors
+    foreach other-authors [ a ->
+      let other-agent turtle a
+      if other-agent != nobody and other-agent != self [
+        if not link-neighbor? other-agent [
+          create-coedit-with other-agent [
+            set color gray
+            set thickness 0.1
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  ; --- 4c. Benefit and motivation update ---
+  ; REVIEW (Q3): ESR/mutualism-index are cumulative over the whole run;
+  ;   a sliding-window version would better reflect the "live" state.
+  let local-benefit ([resource-value] of target * resource-benefit-weight) +
+                    ([quality] of target * quality-benefit-weight) +
+                    (topic-match * topic-benefit-weight)
+
+  set benefit-gain benefit-gain + local-benefit
+  set motivation max (list 0.05
+                 (min (list 1
+                 (motivation + motivation-recovery * local-benefit - motivation-fatigue))))
+  set my-last-page target
+  set my-edit-count my-edit-count + 1
+  set total-edits total-edits + 1
+
+  ; --- bipartite edit log (one row per edit event) ---
+  let pageid (word [pxcor] of target "_" [pycor] of target)
+  let entry (list ticks who pageid specialty [topic-tag] of target [quality] of target)
+  set edge-log lput entry edge-log
+
+  ; v2 — count edits on active tasks (for task-edit-share / edits-on-tasks).
+  ; Uses target-was-task?, captured before editing, so the edit that
+  ; completes a task is counted too.
+  if target-was-task? [
+    set edits-on-tasks-count edits-on-tasks-count + 1
+  ]
+
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; metrics
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+; Recompute the global monitors each tick. ESR is event-level and
+; cumulative; the alternative patch-level reporter is esr-value.
+to update-metrics
+  if total-edits > 0 [
+    set ESR cross-author-edits / total-edits
+  ]
+  set mean-quality mean [quality] of patches
+  set mean-resource-value mean [resource-value] of patches
+  set mutualism-index (mean [benefit-gain] of contributors + mean-resource-value) / 2
+  set coediting-density network-density
+  set active-pages-share count patches with [edit-count > 0] / count patches
+end
+
+; Colour a patch according to its state.
+;  - task patches: green when complete, red-tinted when incomplete with
+;    high maintenance-need, orange otherwise.
+;  - non-task patches: grey when never edited, otherwise shaded by
+;    resource-value (sky < 0.4, blue 0.4-0.7, violet >= 0.7).
+to recolor-patch
+  if is-task? [
+    if completeness >= task-completion-threshold [
+      set pcolor green
+    ]
+    if completeness < task-completion-threshold [
+      if maintenance-need > 0.6 [
+        set pcolor red + 1
+      ]
+      if maintenance-need <= 0.6 [
+        set pcolor orange
+      ]
+    ]
+  ]
+
+  if not is-task? [
+    if edit-count = 0 [
+      set pcolor gray + 2
+    ]
+    if edit-count > 0 and resource-value < 0.4 [
+      set pcolor sky
+    ]
+    if edit-count > 0 and resource-value >= 0.4 and resource-value < 0.7 [
+      set pcolor blue
+    ]
+    if edit-count > 0 and resource-value >= 0.7 [
+      set pcolor violet
+    ]
+  ]
+end
+
+; Density of the co-editing network = 2 * links / (n * (n-1)).
+to-report network-density
+  let n count contributors
+  if n < 2 [ report 0 ]
+  report (2 * count coedits) / (n * (n - 1))
+end
+
+; v1 — Fixed task-completion-rate: completed tasks / initial tasks.
+; A task counts as completed once its completeness reaches the threshold.
+; Denominator is now the number of task-flagged patches at setup
+; (initial-task-count), NOT all patches with task-complexity > 0.
+to-report task-completion-rate
+  if initial-task-count = 0 [ report 0 ]
+  report tasks-completed / initial-task-count
+end
+
+; Mean shared-mental-model across all contributors.
+to-report mean-shared-mental-model
+  if not any? contributors [ report 0 ]
+  report mean [shared-mental-model] of contributors
+end
+
+; Mean number of unique authors per edited patch.
+to-report mean-authors-per-page
+  if not any? patches with [edit-count > 0] [ report 0 ]
+  report mean [length edit-authors] of patches with [edit-count > 0]
+end
+
+;;;
+
+; Write the bipartite edit log to a CSV file with a header row.
+to save-edge-log [filename]
+  file-open filename
+  file-print "tick,author_id,pageid,specialty,topic_tag,quality"
+  foreach edge-log [ e1 ->
+    file-print
+      (word (item 0 e1) ","      ; tick
+            (item 1 e1) ","      ; author_id
+            (item 2 e1) ","      ; pageid
+            (item 3 e1) ","      ; specialty
+            (item 4 e1) ","      ; topic_tag
+            (precision (item 5 e1) 4))  ; quality
+  ]
+  file-close
+end
+
+;;;
+]]></code>
+  <widgets>
+    <view x="295" wrappingAllowedX="true" y="12" frameRate="30.0" minPycor="-16" height="434" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="true" width="434" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <slider x="20" step="1" y="135" max="40" width="250" display="num-tasks" height="50" min="1" direction="Horizontal" default="17.0" variable="num-tasks"></slider>
+    <slider x="24" step="1" y="201" max="12" width="250" display="topic-count" height="50" min="2" direction="Horizontal" default="5.0" variable="topic-count"></slider>
+    <slider x="23" step="1" y="267" max="8" width="250" display="vision-radius" height="50" min="1" direction="Horizontal" default="4.0" variable="vision-radius"></slider>
+    <slider x="17" step="0.01" y="330" max="0.2" width="250" display="evaporation-rate" height="50" min="0.01" direction="Horizontal" default="0.02" variable="evaporation-rate"></slider>
+    <slider x="14" step="0.01" y="386" max="0.2" width="250" display="diffusion-rate" height="50" min="0" direction="Horizontal" default="0.11" variable="diffusion-rate"></slider>
+    <slider x="10" step="0.05" y="438" max="2.0" width="250" display="edit-increment" height="50" min="0.05" direction="Horizontal" default="1.4" variable="edit-increment"></slider>
+    <slider x="16" step="1" y="67" max="80" width="250" display="num-contributors" height="50" min="5" direction="Horizontal" default="28.0" variable="num-contributors"></slider>
+    <button x="22" y="17" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
+    <slider x="11" step="0.1" y="492" max="1" width="250" display="p-explicit" height="50" min="0" direction="Horizontal" default="0.4" variable="p-explicit"></slider>
+    <slider x="12" step="0.01" y="548" max="0.2" width="250" display="mutualism-gain-factor" height="50" min="0.01" direction="Horizontal" default="0.03" variable="mutualism-gain-factor"></slider>
+    <slider x="15" step="0.01" y="605" max="0.2" width="250" display="lambda-smm" height="50" min="0" direction="Horizontal" default="0.15" variable="lambda-smm"></slider>
+    <monitor x="810" precision="17" y="9" height="60" fontSize="11" width="126" display="ESR">ESR</monitor>
+    <monitor x="810" precision="17" y="74" height="60" fontSize="11" width="131" display="Mean quality">mean-quality</monitor>
+    <button x="97" y="18" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <monitor x="810" precision="17" y="460" height="60" fontSize="11" width="141" display="mean-authors-per-page">mean-authors-per-page</monitor>
+    <monitor x="810" precision="17" y="395" height="60" fontSize="11" width="143" display="Mean SMM">mean-shared-mental-model</monitor>
+    <monitor x="810" precision="17" y="331" height="60" fontSize="11" width="145" display="Task completion rate">task-completion-rate</monitor>
+    <monitor x="810" precision="17" y="269" height="60" fontSize="11" width="145" display="Coediting density">coediting-density</monitor>
+    <monitor x="810" precision="17" y="200" height="60" fontSize="11" width="142" display="Mutualism index">mutualism-index</monitor>
+    <monitor x="810" precision="17" y="139" height="60" fontSize="11" width="134" display="Mean resource value">mean-resource-value</monitor>
+    <monitor x="810" precision="17" y="528" height="60" fontSize="11" width="147" display="EitedPatches"><![CDATA[count patches with [edit-count > 0]]]></monitor>
+    <monitor x="810" precision="17" y="591" height="60" fontSize="11" width="144" display="Edited_Not_inTask"><![CDATA[count patches with [not is-task? and edit-count > 0]]]></monitor>
+    <plot x="511" autoPlotX="true" yMax="10.0" autoPlotY="true" y="638" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" display="Coverage">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="EditedPage" color="-16777216" legend="true">
+        <setup></setup>
+        <update><![CDATA[plot count patches with [edit-count > 0]]]></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Task-completion" color="-3844592" legend="true">
+        <setup></setup>
+        <update>plot task-completion-rate</update>
+      </pen>
+    </plot>
+    <plot x="275" autoPlotX="true" yMax="10.0" autoPlotY="true" y="451" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" display="Coordination">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="ESR" color="-14070903" legend="true">
+        <setup></setup>
+        <update>plot ESR</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Coedit-density" color="-5298144" legend="true">
+        <setup></setup>
+        <update>plot coediting-density</update>
+      </pen>
+    </plot>
+    <plot x="511" autoPlotX="true" yMax="10.0" autoPlotY="true" y="449" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" display="Artifact development">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Quality" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot mean-quality</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Resource-value" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plot mean-resource-value</update>
+      </pen>
+    </plot>
+    <slider x="12" step="0.05" y="665" max="1" width="250" display="activity-probability" height="50" min="0" direction="Horizontal" default="0.85" variable="activity-probability"></slider>
+    <monitor x="810" precision="17" y="668" height="60" fontSize="11" width="100">page-diversity</monitor>
+    <monitor x="810" precision="17" y="738" height="60" fontSize="11" width="100">gini-edits</monitor>
+    <plot x="273" autoPlotX="true" yMax="10.0" autoPlotY="true" y="634" xMin="0.0" height="175" legend="true" xMax="10.0" yMin="0.0" width="230" display="Emergence">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Mutualism" color="-5298144" legend="true">
+        <setup></setup>
+        <update>plot mutualism-index</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Shared-mental-model" color="-15040220" legend="true">
+        <setup></setup>
+        <update>plot mean-shared-mental-model</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+This model — **STiMUS: Stigmergic–Mutualistic IMOI Model** — simulates teamwork in a socio‑technical system where contributors collaborate through shared digital artefacts such as wiki pages, code files, issue tickets, project cards, or Scratch projects. Artefacts are represented as NetLogo patches; contributors as turtles of the `contributor` breed.
+
+The model combines two coordination mechanisms:
+
+- **Stigmergy** — indirect coordination through traces left in a shared environment. Each edit deposits a pheromone that diffuses to neighbouring patches and evaporates over time, so recent activity makes an artefact more attractive to others (as edits, commits, comments, labels, and templates do on real platforms).
+- **Mutualism** — a reciprocal benefit loop between contributors and artefacts, inspired by socio‑semantic mutualistic networks where communities and documents co‑evolve through repeated use and reuse. Valuable, well‑maintained artefacts raise contributor motivation and shared understanding; motivated contributors improve artefacts.
+
+The model instantiates the **IMOI (Input–Mediator–Output–Input)** framework at the team level: contributors act on artefacts, artefacts store and transform traces, and the resulting coordination patterns feed back into contributors' motivation and shared mental models. It is designed to be conceptually close to real platforms such as MediaWiki, GitLab, Trello, and Scratch, and to support empirical comparison with their activity logs.
+
+> **What is new in version 1.** A participation slider `activity-probability`; three new reporters `page-diversity`, `gini-edits`, `non-task-active-pages`; a bug fix in `task-completion-rate`; and short comments on every procedure. Default slider values reproduce the previous validated release exactly (runs are seed‑identical). AI contributor types, the `ai-share` slider, the `show-topics?` / `count-ai-in-esr?` switches, a human‑only / all‑agents ESR split, and a Gini coefficient of edits per patch are described in the pedagogical guide but are **not** implemented in this release; they are listed under EXTENDING THE MODEL.
+
+## HOW IT WORKS
+
+Each patch carries two layers of state corresponding to the stigmergic and mutualistic mechanisms, plus task flags.
+
+**Stigmergic layer**
+
+- `pheromone` — accumulated trace intensity; diffuses and evaporates.
+- `quality` — content quality in [0, 1].
+- `completeness` — task / content completion in [0, 1].
+- `recentness` — ticks since last edit (initialised to 9999).
+- `last-editor-id` — `who` of the most recent editor, or −1; enables cross‑author succession detection.
+- `edit-count` — total edits received.
+- `edit-authors` — list of **unique** author `who` values (deduplicated, so it is not a full chronological edit history).
+
+**Mutualistic layer**
+
+- `resource-value` — accumulated benefit available to visiting contributors in [0, 1].
+- `reuse-count` — number of reuse / edit events (distinct from `edit-count`).
+- `maintenance-need` — degradation accumulator in [0, 1]; grows when the artefact receives no attention.
+- `topic-tag` — integer in [0, topic-count − 1]; the artefact's domain, enabling specialty matching.
+
+**Task flags**
+
+- `is-task?` — whether the patch is a designated task (set to `false` once the patch reaches the completion threshold).
+- `task-complexity` — complexity in [0, 1].
+
+### Contributors (agents)
+
+Each contributor has:
+
+- `skill` — competence for editing in [0.3, 1.0].
+- `motivation` — engagement in [0.05, 1.0]; updated over time.
+- `shared-mental-model` — proxy for team shared understanding (SMM) in [0, 1].
+- `specialty` — preferred topic index in [0, topic-count − 1]; matched against `topic-tag`.
+- `my-last-page` — last edited patch or `nobody`.
+- `my-edit-count` — the contributor's total edits.
+- `benefit-gain` — cumulative benefit obtained from artefacts.
+- `explicit-mode?` — whether the current step used explicit task assignment.
+
+At each tick, every contributor (subject to `activity-probability`) performs a four‑step cycle:
+
+1. **Choose a target artefact.** With probability `p-explicit` the contributor enters explicit mode and picks, among visible candidates, the one maximising `task-complexity + maintenance-need + (1 − completeness)` — modelling explicit task assignment (tickets, talk pages, assignments). Otherwise it uses a stigmergic ant‑colony‑optimization‑style rule and picks the visible patch maximising
+
+   W = (pheromone + 0.01)^alpha * ((1 − completeness) + 0.01)^beta * (1 + resource-value + maintenance-need) * S
+
+   where alpha = 1.6, beta = 1.3, and S = 1 + 0.35 when `topic-tag` equals the contributor's `specialty`, else S = 1. Selection is deterministic (`max-one-of`); stochasticity enters through initialisation, the explicit‑mode Bernoulli switch, probabilistic activation, fallback `one-of`, and agent ordering — not through a probabilistic roulette.
+
+2. **Edit the artefact.** Edit power = `skill * (0.5 + 0.5 * motivation) * (1 + topic-match * 0.30 + explicit-bonus)`. The edit increases `pheromone`, `quality`, `completeness`, and `reuse-count`; raises `resource-value`; lowers `maintenance-need`; appends the editor to `edit-authors`; and sets `last-editor-id`. If an `is-task?` patch reaches the completion threshold (0.90) it is marked complete and a completed‑tasks counter is incremented.
+
+3. **Update the shared mental model.** If the previous `last-editor-id` was a different contributor, this is a cross‑author succession: `cross-author-edits` increases, the editor's `shared-mental-model` grows by `lambda-smm`, and a co‑editing link is created with the previous editor (and with every other prior author of the artefact). This operationalises the idea that repeated cross‑author succession on the same artefact builds shared understanding.
+
+4. **Receive mutualistic benefit.** The contributor's `motivation` increases with a local benefit drawn from the visited artefact (weighted combination of `resource-value`, `quality`, and topic match), minus a small fatigue term. `benefit-gain` and `my-edit-count` are updated, and a bipartite edge `(tick, author_id, pageid, specialty, topic_tag, quality)` is appended to the edit log. Productive artefacts make productive contributors, and vice versa.
+
+After all contributors have acted, the environment is updated globally: pheromone diffuses and evaporates, every artefact ages (`recentness`), drifts toward higher `maintenance-need`, and decays in `resource-value`; then the aggregate metrics are recomputed.
+
+## HOW TO USE IT
+
+### Interface controls
+
+**Sliders (independent variables)**
+
+- `num-contributors` — number of contributor agents.
+- `num-tasks` — number of patches flagged as tasks at setup.
+- `topic-count` — number of topic domains.
+- `vision-radius` — contributor sensing range (patches).
+- `evaporation-rate` — pheromone evaporation per tick (trace persistence).
+- `diffusion-rate` — pheromone diffusion coefficient.
+- `edit-increment` — pheromone deposited per edit.
+- `p-explicit` — probability of explicit task assignment.
+- `lambda-smm` — shared‑mental‑model growth per cross‑author edit.
+- `mutualism-gain-factor` — resource‑value increment per edit (strength of the mutualism loop).
+- `activity-probability` *(v1, default 1.0)* — probability that a contributor acts in a given tick. At 1.0 every contributor acts every tick (original semantics); below 1.0 a tick becomes a "session" in which only a subset of contributors are active, producing participation inequality.
+
+**Buttons**
+
+- `setup` — initialise all patches and contributors.
+- `go` — run the model continuously.
+- `go-once` — advance one tick.
+
+**Monitors and reporters (outputs)**
+
+- `ESR` — event‑level Edit Succession Ratio = `cross-author-edits / total-edits`.
+- `esr-value` — patch‑level ESR: share of edited patches with more than one unique author. Not identical to `ESR`.
+- `mean-quality`, `mean-resource-value` — patch means.
+- `mutualism-index` — `(mean contributor benefit-gain + mean-resource-value) / 2`.
+- `coediting-density` — density of the co‑editing network.
+- `active-pages-share` — share of patches with at least one edit.
+- `task-completion-rate` *(v1 fixed)* — `tasks-completed / initial-task-count`.
+- `mean-shared-mental-model`, `mean-authors-per-page`, `bigraph-edges`, `active-pages`, `active-authors`.
+- `page-diversity` *(v1)* — normalised Shannon entropy of the edit‑count distribution across edited patches (0 = all edits on one patch, 1 = perfectly even across active patches).
+- `gini-edits` *(v1)* — Gini coefficient of `my-edit-count` across all contributors (0 = equal participation; approaches 1 as participation concentrates). Stays near 0 at `activity-probability = 1.0`.
+- `non-task-active-pages` *(v1)* — edited patches that are not currently tasks. Note: completed tasks (set `is-task?` false) are included.
+- `edge-log-csv` — the full bipartite edit log as a CSV string; `save-edge-log [filename]` writes it to a file.
+
+### Typical use
+
+1. Choose team size (`num-contributors`) and task load (`num-tasks`), then press **setup**.
+2. Keep `p-explicit` low (e.g. 0.1) and run **go** for a few hundred ticks. Watch how artefact colours and plots evolve.
+3. Vary `p-explicit`, `evaporation-rate`, and `mutualism-gain-factor` to see how they affect ESR, mutualism, quality, and diversity.
+
+## THINGS TO NOTICE
+
+- How quickly do **"paths" of activity** emerge — stable streaks of high‑pheromone, high‑quality artefacts?
+- Watch **neglected artefacts** with high `maintenance-need`. Do they eventually attract contributors, and through which mode — stigmergic pull or explicit assignment?
+- Track `page-diversity`: low diversity means the team is converging on a few artefacts; high diversity means work is spread thinly. How does this trade off against `mean-quality`?
+- Track `gini-edits`. At `activity-probability = 1.0` it stays near 0; lower it and watch participation inequality appear. Does inequality help or hurt `task-completion-rate`?
+- Under low `p-explicit`, do teams still raise `mean-quality` and `mean-resource-value`? Does this reproduce the idea that stigmergic coordination often dominates explicit coordination in large wiki and FLOSS projects?
+- Compare the two ESR quantities: event‑level `ESR` vs patch‑level `esr-value`. When do they diverge, and why?
+
+## THINGS TO TRY
+
+- **Stigmergy vs explicit coordination.** Run with `p-explicit = 0.0`, then 0.3, 0.5, 0.8. Compare final `mean-quality`, `ESR`, `task-completion-rate`, and `coediting-density`.
+- **Trace persistence.** Sweep `evaporation-rate` from very low to very high. Is there an intermediate value where `mean-quality`, `ESR`, and `page-diversity` are jointly maximised (too little memory vs too much memory in the environment)?
+- **Mutualism loop.** Sweep `mutualism-gain-factor` from 0 to 0.12. With the loop off (`0`), does `mean-quality` still rise, and how does `mutualism-index` separate from it?
+- **Participation inequality.** Lower `activity-probability` from 1.0 toward 0.2. Watch `gini-edits` rise; control for `total-edits` so you are not just seeing fewer edits.
+- **Search and specialisation complexity.** Factorial `vision-radius` [2, 5] × `topic-count` [2, 5, 10]. Does narrower vision or more topics fragment the co‑editing network?
+- **Calibration against real logs.** Export `edge-log` to CSV and compare its aggregate statistics (edit‑count distribution, ESR, co‑editing density, `bigraph-edges`) to activity logs from MediaWiki, GitLab, Trello, or Scratch. Tune `evaporation-rate` and `p-explicit` to match.
+
+## EXTENDING THE MODEL
+
+- **AI contributor types.** Add a `contributor-type` variable (`"human"`, `"bot"`, `"llm-assistant"`, `"pipeline"`) and an `ai-share` slider; let bots focus on high `maintenance-need`, LLM assistants follow stigmergic cues but not accumulate SMM, and pipelines run scripted actions.
+- **Switches.** `show-topics?` (colour by `topic-tag`) and `count-ai-in-esr?` (split `ESR` into human‑only and all‑agents).
+- **Gini of edits per patch.** The pedagogical guide mentions a patch‑level Gini; this release has only the contributor‑level `gini-edits`.
+- **Dynamic vision radius.** Scale `vision-radius` with `shared-mental-model` so well‑integrated contributors "see" more.
+- **Quality‑weighted SMM transfer.** Weight `lambda-smm` by target `quality` to model how much context the previous edit actually transmitted.
+- **Sliding‑window ESR.** ESR and `mutualism-index` are cumulative; a rolling‑window version would diagnose "live" coordination.
+- **Conflict resolution.** Model edit conflicts when two contributors edit the same patch in one tick with low SMM.
+- **Contributor‑specific activity propensities.** Give each contributor a persistent `activity-rate` drawn from a distribution (e.g. beta) so that lowering the global `activity-probability` produces stable heavy‑tailed participation inequality, not just homogeneous sparsity. This would make `gini-edits` a more discriminating measure.
+- **`was-task?` flag.** Distinguish "edited patches that were never tasks" from the current `non-task-active-pages`, which includes completed tasks.
+
+## NETLOGO FEATURES
+
+- `diffuse` spreads the `pheromone` patch variable; evaporation is a manual per‑patch update.
+- Co‑editing links use an `undirected-link-breed` (`coedits`); `link-neighbor?` prevents duplicate edges.
+- `max-one-of` provides deterministic ACO‑style selection (not a probabilistic roulette).
+- The bipartite edit log is a plain NetLogo list of lists; `remove-duplicates` over a `map` yields distinct contributor–page pairs (`bigraph-edges`).
+- `activity-probability >= 1` takes a fast path that consumes no random number, preserving seed‑identical reproduction at the default.
+
+## RELATED MODELS
+
+- **Ants** (NetLogo Models Library) — the canonical stigmergic foraging model whose pheromone diffusion/evaporation STiMUS reuses.
+- **Team assembly / collaboration models** in the social science section — for comparison of co‑editing network formation.
+- **Preferential attachment** models — for contrast with stigmergic (trace‑driven) versus network‑driven concentration of activity.
+
+## CREDITS AND REFERENCES
+
+- Model design and implementation: Yevgeny Patarakin (Institute of Education, HSE University; Institute of Digital Education, Moscow City University).
+- IMOI framework: Ilgen, D. R., Hollenbeck, J. R., Johnson, M., & Jundt, D. (2005). Teams in organizations: From input-process-output models to IMOI models. *Annual Review of Psychology*, 56, 517–543.
+- Stigmergy: Theraulaz, G., & Bonabeau, E. (1999). A brief history of stigmergy. *Artificial Life*, 5(2), 97–116.
+- Ant Colony Optimization: Dorigo, M., & Stützle, T. (2004). *Ant Colony Optimization*. MIT Press.
+- Shared mental models / exchange of action‑modes: Rubtsov, V. V. (full citation to be added).
+- ODD protocol: Grimm, V., et al. (2006; 2010; 2020).
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="STiMUS_v2.1_E1_explicit_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="2"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0"></value>
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+          <value value="0.3"></value>
+          <value value="0.4"></value>
+          <value value="0.5"></value>
+          <value value="0.6"></value>
+          <value value="0.7"></value>
+          <value value="0.8"></value>
+          <value value="0.9"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0.06"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E2_stigmergy_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="2"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.005"></value>
+          <value value="0.01"></value>
+          <value value="0.02"></value>
+          <value value="0.05"></value>
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+          <value value="0.3"></value>
+          <value value="0.4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.01"></value>
+          <value value="0.05"></value>
+          <value value="0.1"></value>
+          <value value="0.15"></value>
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0.06"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E3_mutualism_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="2"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0"></value>
+          <value value="0.03"></value>
+          <value value="0.06"></value>
+          <value value="0.09"></value>
+          <value value="0.12"></value>
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E4_inequality_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0.06"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+          <value value="0.3"></value>
+          <value value="0.4"></value>
+          <value value="0.5"></value>
+          <value value="0.6"></value>
+          <value value="0.7"></value>
+          <value value="0.8"></value>
+          <value value="0.9"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E5_search_topic_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0.06"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E6_decoupling_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0"></value>
+          <value value="0.25"></value>
+          <value value="0.5"></value>
+          <value value="0.75"></value>
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0"></value>
+          <value value="0.03"></value>
+          <value value="0.09"></value>
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E7_scale_load_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="10"></value>
+          <value value="25"></value>
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="10"></value>
+          <value value="25"></value>
+          <value value="50"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="2"></value>
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0.06"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="STiMUS_v2.1_E8_twoaxis_factorial_500_50" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="500">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition><![CDATA[ticks >= 500]]></exitCondition>
+      <metrics>
+        <metric>ESR</metric>
+        <metric>coediting-density</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-resource-value</metric>
+        <metric>mutualism-index</metric>
+        <metric>task-completion-rate</metric>
+        <metric>mean-shared-mental-model</metric>
+        <metric>page-diversity</metric>
+        <metric>gini-edits</metric>
+        <metric>bigraph-edges</metric>
+        <metric>total-edits</metric>
+        <metric>cross-author-edits</metric>
+        <metric><![CDATA[count patches with [edit-count > 0]]]></metric>
+        <metric>non-task-active-pages</metric>
+        <metric>mean-motivation</metric>
+        <metric>benefit-gain-per-edit</metric>
+        <metric>mutualism-index-norm</metric>
+        <metric>edits-on-tasks</metric>
+        <metric>edits-on-non-tasks</metric>
+        <metric>task-edit-share</metric>
+        <metric>resource-edit-correlation</metric>
+        <metric>explicit-edit-share</metric>
+        <metric>explicit-hit-rate</metric>
+        <metric>explicit-fallback-rate</metric>
+        <metric>active-task-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="num-contributors">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-tasks">
+          <value value="25"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="topic-count">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-radius">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="evaporation-rate">
+          <value value="1"></value>
+          <value value="0.2"></value>
+          <value value="0.05"></value>
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="diffusion-rate">
+          <value value="0"></value>
+          <value value="0.05"></value>
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="edit-increment">
+          <value value="0.6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="p-explicit">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="lambda-smm">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-gain-factor">
+          <value value="0"></value>
+          <value value="0.03"></value>
+          <value value="0.09"></value>
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-probability">
+          <value value="0.7"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
