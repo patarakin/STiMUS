@@ -22,7 +22,7 @@ STiMUS/
 │                             all six files -- see data/README.md.
 │
 ├── scripts/
-│   ├── collect_wiki_data.R   Collects revision-history data from a Scratch wiki's
+│   ├── collect_wiki_data.r   Collects revision-history data from a Scratch wiki's
 │   │                         MediaWiki Action API (action=query&list=allrevisions)
 │   │                         and writes it to the common wiki_df_events_<lang>.csv
 │   │                         schema used throughout this repository.
@@ -36,12 +36,11 @@ STiMUS/
 │
 ├── models/
 │   ├── STiMUS_v2.1/          Human-only stigmergic-mutualistic ABM (NetLogo).
-│   │                         ODD protocol + CoMSES deposit notes.
-│   └── STiMUS-HAI_v3.1/      Human-AI extension: a second agent breed
+│   │                         ODD protocol + CoMSES deposit notes + STiMUS_v2.1.nlogox
+│   └── STiMUS-HAI_v3.1/      Human-AI extension: STiMUS-HAI_v3.1.nlogox
 │                             (ai-agents), ai-share / judgment-share sliders,
 │                             ai-trust mechanic. CoMSES deposit notes.
-│                             (NetLogo .nlogo file(s) to be added alongside
-│                             the deposit notes.)
+│                           
 │
 └── README.md                 This file.
 ```
