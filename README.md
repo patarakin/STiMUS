@@ -104,9 +104,9 @@ the model. No separate R scripts, datasets, or figures are included in this fold
 
 ## Citation
 
-If you use this data or these models, please cite the paper above and, for the
-models specifically, the corresponding CoMSES Network deposit (DOI to be
-assigned on deposit; placeholder to be updated on publication).
+Yevgeny Patarakin (2026, August 20). “STiMUS-HAI: A Stigmergic–Mutualistic Agent-Based Model of Human-AI Collaboration on Shared Digital Artefacts” (Version 1.1.0). CoMSES Computational Model Library. Retrieved from: https://doi.org/10.25937/6jh3-8x66
+
+
 
 For MUTUS, use its corresponding CoMSES deposit when available; the paper above
 should not be treated as a publication reporting MUTUS results.
