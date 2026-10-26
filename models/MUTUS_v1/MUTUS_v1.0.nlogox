@@ -1,0 +1,2428 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; MUTUS — Mutualism in Texts and Understanding of Students
+;; NetLogo 7 — version 1.0 (model ladder M0–M5a)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;
+;; Specification: MUTUS_ODD_v1.0.md (section numbers in comments, e.g. §7.3).
+;; Parent model:  STiMUS v2.1 (stigmergy removed; see ODD Appendix A).
+;;
+;; One computational core, two worlds ("meadow" / "wiki"), six levels:
+;;   M0  heterogeneous activity, neutral partner choice
+;;   M1  + trait matching (ZPD band)                  trait-matching?
+;;   M2  + mutualistic feedback, resource dynamics    feedback?
+;;   M3  + adaptive foraging                          adaptive-foraging?
+;;   M4  + trait development (learning)               trait-development?
+;;   M5a + renewal of faded resources                 renewal?
+;; Any combination of switches is valid. M4 needs M1, M5a needs M2.
+;;
+;; Clarifications (kept from the development versions):
+;;  (C1) feedback? = off is a strict commensal control: resource state is held
+;;       constant and reward is restored to reward-max at the end of each tick.
+;;  (C2) Foragers start at a random resource (+ small noise).
+;;  (C3) prev-resource ("carried pollen") is updated only after successful
+;;       visits (eta > 0): a failed visit leaves no pollen and no link.
+;;  (C5) World parameters (zpd-below, zpd-above, cross-cluster-efficiency,
+;;       scaffolding) are fixed by world-type in setup (ODD §7.11).
+;;
+;; Data: all output is collected with BehaviorSpace reporters (one table per
+;; experiment) and analysed with MUTUS_analysis.R.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+globals [
+  ;; ---- fixed internal parameters (§7.11) ----
+  fr-a fr-h              ; attack rate and handling time, Holling type II
+  gamma-conv             ; conversion of gain into energy
+  eta-low                ; handling efficiency for too-easy resources
+  kappa                  ; novelty decay with familiarity (wiki)
+  pi0                    ; service factor without carried pollen
+ effort-min             ; adaptive foraging: effort floor (M3)
+  basal-cost             ; per-tick energy loss
+  e-min e-wake r-dorm    ; dormancy thresholds and recovery rate
+  delta-v delta-q        ; vitality and quality decay (M2)
+  v-min                  ; threshold for an alive resource
+  reward-max             ; reward capacity
+  cluster-ring-radius    ; radius of the ring of cluster centres
+  ;; ---- run bookkeeping ----
+  run-id run-seed
+  cluster-centers        ; list of [x y]
+  ;; ---- counters ----
+  total-visits total-fails total-services total-gain
+  services-with-pollen cross-services
+  band-visits easy-visits          ; v0.4: visits inside / below the ZPD band
+  mean-skill-0                     ; v0.4: mean skill at setup
+  visit-records                    ; v0.4: "tick:forager:resource" of successful visits
+  renewal-count                    ; v0.5: number of renewals in the run
+  renewal-records                  ; v0.5: "tick:resource:parent:author:old-c:new-c"
+  v-renew                          ; v0.5: vitality of a renewed resource
+  visits-this-tick
+  ;; ---- monitors (§2.4) ----
+  share-active-foragers share-alive-resources
+  mean-quality mean-energy mean-skill
+  fail-rate service-rate cross-cluster-share
+  mean-gain-per-visit unique-links connectance-obs
+  ;; ---- world parameters, fixed by world-type (§7.11) ----
+  zpd-below zpd-above              ; ZPD band: tolerance below / above
+  cross-cluster-efficiency         ; pollen / concept transfer between clusters
+  scaffolding                      ; quality lowers effective complexity (wiki)
+  run-length                       ; one season / semester = 150 ticks
+]
+
+;; resources are created first, so their who numbers are 0 .. num-resources - 1
+breed [resources resource]
+breed [foragers forager]
+
+resources-own [
+  res-index        ; = who; index into the foragers' lists
+  cluster-id       ; species / topic
+  complexity       ; corolla depth / conceptual difficulty, [0,1]
+  eff-complexity   ; complexity · (1 − scaffolding · quality)
+  reward           ; nectar standing crop / open contribution opportunities
+  vitality         ; floral display / currency in course discourse
+  quality          ; pollination success / content quality
+  visit-count
+  service-count
+  alive?
+  birth-tick       ; v0.5: tick of the last renewal (0 = initial resource)
+  generation       ; v0.5: number of renewals of this slot
+]
+
+foragers-own [
+  activity         ; probability of acting in a tick
+  energy           ; energy reserve / motivation, [0,1]
+  skill            ; handling skill (meadow) / competence (wiki), [0,1]
+  skill-0          ; v0.4: skill at setup
+  cheater?         ; reserved (nectar robber / read-only student); false in v1.0
+  effort           ; list over resources, sums to 1 (used from M3)
+  familiarity      ; list over resources: number of visits (wiki novelty)
+  succ-visits      ; list over resources: number of successful visits
+  mean-gain        ; running mean of gains (used from M3)
+  prev-resource    ; source of carried pollen / concepts
+  active?
+]
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SETUP (§5)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to setup
+  clear-all
+  check-ladder
+  setup-constants
+  apply-world-defaults                            ; C5 (v1.0: always)
+  setup-seed
+  setup-landscape
+  setup-clusters
+  setup-resources
+  setup-foragers
+  setup-development                               ; v0.4
+  update-monitors
+  reset-ticks
+end
+
+;; All levels M0–M5a are implemented; any combination of switches is allowed.
+;; Without trait-matching? the ZPD band is undefined, so M4 does nothing;
+;; without feedback? resources never fade, so M5a does nothing.
+to check-ladder
+end
+
+to setup-constants
+  set fr-a 2
+  set fr-h 1
+  set gamma-conv 0.5
+  set eta-low 0.3
+  set kappa 0.3
+  set pi0 ifelse-value world-type = "meadow" [ 0 ] [ 0.5 ]
+  set effort-min 0.001
+  set basal-cost 0.005
+  set e-min 0.05
+  set e-wake 0.3
+  set r-dorm 0.002
+  set delta-v 0.02                ; v0.2: was 0.01 (an unvisited resource now falls
+                                  ; below v-min in ~80 ticks, i.e. within a semester)
+  set delta-q ifelse-value world-type = "meadow" [ 0 ] [ 0.003 ]
+  set v-min 0.1
+  set reward-max 1
+  set cluster-ring-radius 12
+  set v-renew 0.3                 ; v0.5: renewed resource starts above v-min
+  set run-length 150              ; v1.0: one season / semester
+end
+
+;; World parameters of ODD §7.11 (clarification C5).
+to apply-world-defaults
+  ifelse world-type = "meadow" [
+    set zpd-below 0.30
+    set zpd-above 0.05
+    set cross-cluster-efficiency 0.2
+    set scaffolding 0
+  ] [
+    set zpd-below 0.20
+    set zpd-above 0.20
+    set cross-cluster-efficiency 0.8
+    set scaffolding 0.5
+  ]
+end
+
+to setup-seed
+  ifelse behaviorspace-run-number > 0 [
+    set run-id behaviorspace-run-number
+    set run-seed behaviorspace-run-number
+  ] [
+    set run-id 0
+    set run-seed new-seed
+  ]
+  random-seed run-seed
+end
+
+to setup-landscape
+  ask patches [ set pcolor ifelse-value world-type = "meadow" [ 58 ] [ 9.5 ] ]
+end
+
+to setup-clusters
+  set cluster-centers n-values cluster-count [ k ->
+    (list (cluster-ring-radius * sin (360 * k / cluster-count))
+          (cluster-ring-radius * cos (360 * k / cluster-count))) ]
+end
+
+to setup-resources
+  create-resources num-resources [
+    set res-index who
+    set cluster-id who mod cluster-count
+    let c item cluster-id cluster-centers
+    setxy (clamp-x (item 0 c + random-normal 0 cluster-spread))
+          (clamp-y (item 1 c + random-normal 0 cluster-spread))
+    set complexity random-beta 2 2
+    set quality 0.1
+    set vitality 0.5
+    set reward reward-max
+    set visit-count 0
+    set service-count 0
+    update-eff-complexity
+    set alive? true
+    set birth-tick 0                                ; v0.5
+    set generation 0                                ; v0.5
+    set shape ifelse-value world-type = "meadow" [ "flower" ] [ "square" ]
+    style-resource
+  ]
+end
+
+to setup-foragers
+  create-foragers num-foragers [
+    set activity clip (random-beta (activity-mean * activity-concentration)
+                                   ((1 - activity-mean) * activity-concentration))
+                      0.01 0.99
+    set skill ifelse-value world-type = "meadow"
+      [ 0.2 + random-float 0.7 ]      ; handling skill (proboscis + learning)
+      [ random-beta 2 3 ]             ; novice-heavy study group
+    set energy 0.6
+    set active? true
+    set cheater? false
+    set effort n-values num-resources [ 1 / num-resources ]
+    set familiarity n-values num-resources [ 0 ]
+    set succ-visits n-values num-resources [ 0 ]
+    set mean-gain 0
+    set prev-resource nobody
+    move-to one-of resources                                   ; clarification C2
+    setxy (clamp-x (xcor + random-normal 0 1)) (clamp-y (ycor + random-normal 0 1))
+    set shape ifelse-value world-type = "meadow" [ "bug" ] [ "person" ]
+    set size 1.4
+    style-forager
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; GO (§3.1)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to go
+  if ticks >= run-length [ stop ]                               ; step 1
+  set visits-this-tick 0
+  ask foragers [ forager-step ]                   ; step 2 (random order)
+  update-resources                                ; step 3
+  update-monitors                                 ; step 4
+  tick                                            ; step 5
+  if ticks >= run-length [ stop ]
+end
+
+;; One forager, one tick (§3.1, step 2).
+to forager-step
+  if not active? [
+    rest
+    style-forager
+    stop
+  ]
+  if random-float 1 < activity [ forage ]
+  set energy max list 0 (energy - basal-cost)
+  if energy < e-min [ set active? false ]
+  style-forager
+end
+
+;; §7.8 — dormant foragers recover slowly and reactivate at e-wake.
+to rest
+  set energy energy + r-dorm
+  if energy >= e-wake [ set active? true ]
+end
+
+;; §7.1–7.2
+to forage
+  let perceived resources in-radius perception-radius
+  if not any? perceived [
+    rt random 360
+    if can-move? 1 [ fd 1 ]
+    stop                                          ; the opportunity is lost
+  ]
+  let target choose-resource perceived
+  move-to target
+  visit target
+end
+;; §7.2 — partner choice: roulette with weight W_ik = A_ik · V_k, where
+;;   A_ik = effort_ik  if adaptive-foraging? (M3), otherwise 1;
+;;   V_k  = vitality_k if feedback? (M2),         otherwise 1.
+;; M0–M1: neutral choice. M2: choice follows vitality (floral display /
+;; visibility of the article). M3: choice also follows the forager's own
+;; experience.
+to-report choose-resource [ candidates ]
+  if not (feedback? or adaptive-foraging?) [ report one-of candidates ]
+  let cand sort candidates
+  let w map [ r -> (ifelse-value adaptive-foraging? [ item ([res-index] of r) effort ] [ 1 ])
+                 * (ifelse-value feedback? [ [vitality] of r ] [ 1 ]) ] cand
+  let total sum w
+  if total <= 0 [ report one-of candidates ]
+  let x random-float total
+  let i 0
+  let acc item 0 w
+  while [ acc < x and i < length w - 1 ] [
+    set i i + 1
+    set acc acc + item i w
+  ]
+  report item i cand
+end
+
+
+
+;; §7.3–7.5 — one visit of the calling forager to resource r.
+to visit [ r ]
+  let idx [res-index] of r
+  let d ([eff-complexity] of r) - skill
+  let eta handling-efficiency d
+
+  ;; §7.4 consumption, Holling type II
+  let novelty ifelse-value world-type = "wiki"
+    [ exp (0 - kappa * item idx familiarity) ] [ 1 ]
+  let rw [reward] of r
+  let g eta * novelty * fr-a * rw / (1 + fr-a * fr-h * rw)
+  set g min list g rw
+  ask r [
+    set reward reward - g
+    set visit-count visit-count + 1
+  ]
+
+  ;; §7.3 / §7.5 outcome
+  let outcome "consume"
+  ifelse eta = 0 [
+    set outcome "fail"
+    set total-fails total-fails + 1
+  ] [
+    if (not cheater?) and (random-float 1 < energy) [
+      set outcome "service"
+      deliver-service r
+    ]
+  ]
+
+  ;; §7.8 energy
+  set energy clip (energy + gamma-conv * g - visit-cost) 0 1
+
+  ;; bookkeeping
+  if world-type = "wiki" [
+    set familiarity replace-item idx familiarity (item idx familiarity + 1)
+  ]
+  if eta > 0 [
+    set succ-visits replace-item idx succ-visits (item idx succ-visits + 1)
+    set prev-resource r                           ; clarification C3
+  ]
+  if eta = 1 and trait-matching? [ set band-visits band-visits + 1 ]   ; v0.4
+  if eta > 0 and eta < 1 [ set easy-visits easy-visits + 1 ]           ; v0.4
+  if eta > 0 [ set visit-records lput (word ticks ":" who ":" idx) visit-records ]  ; v0.4
+  if trait-development? [ develop-skill d novelty ] ; v0.4: M4
+  if adaptive-foraging? [ update-effort idx g ]   ; M3
+  set total-visits total-visits + 1
+  set total-gain total-gain + g
+  set visits-this-tick visits-this-tick + 1
+end
+
+;; §7.3 — ZPD band as trait matching.
+to-report handling-efficiency [ d ]
+  if not trait-matching? [ report 1 ]             ; M0
+  if d > zpd-above [ report 0 ]                   ; beyond the ZPD: fail
+  if d < (0 - zpd-below) [ report eta-low ]       ; too easy
+  report 1                                        ; within the band
+end
+
+;; §7.5 — service with carried pollen. In M0–M1 service is counted
+;; but does not change the resource (commensal control, C1).
+to deliver-service [ r ]
+  let pf pollen-factor r
+  set total-services total-services + 1
+  if prev-resource != nobody [
+    set services-with-pollen services-with-pollen + 1
+    if [cluster-id] of prev-resource != [cluster-id] of r [
+      set cross-services cross-services + 1
+    ]
+  ]
+  ask r [ set service-count service-count + 1 ]
+  if feedback? [ apply-feedback r pf ]            ; M2
+end
+
+to-report pollen-factor [ r ]
+  if prev-resource = nobody [ report pi0 ]
+  if [cluster-id] of prev-resource = [cluster-id] of r [ report 1 ]
+  report cross-cluster-efficiency
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; MECHANISMS M2–M4
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; M2 (§7.5) — the service returns to the resource:
+;;   quality_k  ← quality_k  + φ · skill_i · π · (1 − quality_k)
+;;   vitality_k ← vitality_k + φ · π · (1 − vitality_k)
+;; φ = mutualism-strength, π = pollen factor (pollen-factor).
+to apply-feedback [ r pf ]
+  let s skill
+  ask r [
+    set quality  quality  + mutualism-strength * s * pf * (1 - quality)
+    set vitality vitality + mutualism-strength * pf * (1 - vitality)
+  ]
+end
+
+;; M3 (§7.6) — adaptive foraging (discrete replicator form of Valdovinos et al. 2013):
+;;   effort_ik ← effort_ik · max(0, 1 + G-af · (G_ik − mean-gain_i))
+;;   floor effort-min, renormalise to Σ = 1;
+;;   mean-gain_i ← 0.9 · mean-gain_i + 0.1 · G_ik
+;; G-af = adaptation-rate (slider). A visit better than the forager's usual
+;; raises the effort on that resource, a worse one (e.g. a failed visit, G = 0)
+;; lowers it; at high rates one failure drops the effort to the floor.
+to update-effort [ idx g ]
+  let factor max list 0 (1 + adaptation-rate * (g - mean-gain))
+  set effort replace-item idx effort (item idx effort * factor)
+  set effort map [ x -> max list effort-min x ] effort
+  let total sum effort
+  set effort map [ x -> x / total ] effort
+  set mean-gain 0.9 * mean-gain + 0.1 * g
+end
+
+;; M4 (§7.7) — trait development inside the ZPD band (v0.4):
+;;   if −w ≤ d ≤ z:  skill ← skill + λ · ν · (d + w)/(z + w) · (1 − skill)
+;; λ = skill-growth (slider), w = zpd-below, z = zpd-above, ν = novelty of the
+;; visit (= 1 in the meadow; exp(−κ·familiarity) in the wiki: re-reading the
+;; same text teaches less). Learning is maximal at the upper edge of the band
+;; (d = z), zero at its lower edge, and absent for failed (d > z) and too-easy
+;; (d < −w) visits. (1 − skill) gives saturation.
+to develop-skill [ d nu ]
+  if not trait-matching? [ stop ]
+  if d > zpd-above or d < (0 - zpd-below) [ stop ]
+  let span zpd-above + zpd-below
+  if span <= 0 [ stop ]
+  set skill skill + skill-growth * nu * ((d + zpd-below) / span) * (1 - skill)
+end
+
+;; v0.4 — remember initial skills and start the visit record.
+to setup-development
+  ask foragers [ set skill-0 skill ]
+  set mean-skill-0 mean [skill] of foragers
+  set visit-records []
+  set renewal-records []                          ; v0.5
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ENVIRONMENT (§7.9–7.10)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-resources
+  ask resources [
+    ifelse feedback? [
+      ;; M2 (§7.10): a living resource regenerates reward; unattended
+      ;; resources fade (vitality) and become outdated (quality, wiki).
+      set reward reward + regeneration-rate * vitality * (reward-max - reward)
+      set vitality vitality * (1 - delta-v)
+      set quality  quality  * (1 - delta-q)
+    ] [
+      set reward reward-max                       ; clarification C1
+    ]
+    update-eff-complexity
+    set alive? vitality >= v-min
+    style-resource
+  ]
+  if renewal? and feedback? [ renew-resources ]   ; v0.5: M5a
+end
+
+;; M5a (v0.5) — renewal of faded resources in their own slot.
+;; Each tick a resource that is not alive is renewed with probability
+;; renewal-rate. Who sets the complexity of the newcomer is the key contrast:
+;;   meadow: a seedling of a living plant of the same cluster (parent chosen
+;;           with probability ∝ quality = pollination success); corolla depth
+;;           is inherited: c = c_parent + N(0, offspring-sd);
+;;   wiki:   a new article written by an active student within
+;;           perception-radius (author chosen ∝ skill); the author writes at
+;;           the upper edge of his ZPD: c = skill + zpd-above + N(0, offspring-sd).
+;; No parent / no author nearby -> no renewal this tick. The slot (index,
+;; cluster, position) is kept, so all lists and metrics keep their size.
+to renew-resources
+  ask resources with [ not alive? ] [
+    if random-float 1 < renewal-rate [
+      let new-c -1
+      let parent-id -1
+      let author-id -1
+      let found? false
+      ifelse world-type = "meadow" [
+        let cl cluster-id
+        let parents other resources with [ alive? and cluster-id = cl ]
+        if any? parents [
+          let p roulette (sort parents) map [ x -> [quality] of x ] (sort parents)
+          set parent-id [res-index] of p
+          set found? true
+          set new-c [complexity] of p + random-normal 0 offspring-sd
+        ]
+      ] [
+        let authors foragers in-radius perception-radius with [ active? and not cheater? ]
+        if any? authors [
+          let a roulette (sort authors) map [ x -> [skill] of x ] (sort authors)
+          set author-id [who] of a
+          set found? true
+          set new-c [skill] of a + zpd-above + random-normal 0 offspring-sd
+        ]
+      ]
+      if found? [
+        renew-slot (clip new-c 0.01 0.99) parent-id author-id
+      ]
+    ]
+  ]
+end
+
+to renew-slot [ new-c parent-id author-id ]  ; resource procedure
+  let idx res-index
+  let old-c complexity
+  set complexity new-c
+  set quality 0.1
+  set vitality v-renew
+  set reward reward-max
+  set visit-count 0
+  set service-count 0
+  set birth-tick ticks
+  set generation generation + 1
+  update-eff-complexity
+  set alive? true
+  style-resource
+  ;; a new text is new for everybody; adaptive foragers get a fresh prior on it
+  ask foragers [
+    set familiarity replace-item idx familiarity 0
+    set effort replace-item idx effort (1 / num-resources)
+    let total sum effort
+    set effort map [ x -> x / total ] effort
+  ]
+  set renewal-count renewal-count + 1
+  set renewal-records lput (word ticks ":" idx ":" parent-id ":" author-id ":"
+                                  (precision old-c 4) ":" (precision new-c 4)) renewal-records
+end
+
+;; Roulette choice of one item with probability ∝ weight (weights ≥ 0).
+to-report roulette [ items weights ]
+  let total sum weights
+  if total <= 0 [ report one-of items ]
+  let x random-float total
+  let acc 0
+  let i 0
+  while [ i < length items ] [
+    set acc acc + item i weights
+    if x < acc [ report item i items ]
+    set i i + 1
+  ]
+  report last items
+end
+
+to update-eff-complexity  ; resource procedure
+  set eff-complexity complexity * (1 - scaffolding * quality)
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; OBSERVATION (§2.4, §2.6, §4.11)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to update-monitors
+  set share-active-foragers (count foragers with [active?]) / num-foragers
+  set share-alive-resources (count resources with [alive?]) / num-resources
+  set mean-quality mean [quality] of resources
+  set mean-energy mean [energy] of foragers
+  set mean-skill mean [skill] of foragers
+  set fail-rate safe-div total-fails total-visits
+  set service-rate safe-div total-services total-visits
+  set cross-cluster-share safe-div cross-services services-with-pollen
+  set mean-gain-per-visit safe-div total-gain total-visits
+  set unique-links sum [ length filter [ x -> x > 0 ] succ-visits ] of foragers
+  set connectance-obs unique-links / (num-foragers * num-resources)
+end
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; BEHAVIORSPACE REPORTERS — one table per experiment
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; These reporters pack the bipartite network and the node attributes into
+;; strings, so that a single BehaviorSpace table contains everything needed
+;; for network analysis in R. Format: records separated by ";", fields by ":".
+
+;; Effective diet breadth of active foragers: mean of 1 / Σ effort², i.e. the
+;; number of resources a forager effectively divides its effort among
+;; (= num-resources while effort is uniform; falls as foragers specialise).
+to-report effective-diet
+  let fs foragers with [active?]
+  if not any? fs [ set fs foragers ]
+  report mean [ 1 / sum map [ x -> x * x ] effort ] of fs
+end
+
+;; Realised diet breadth: mean inverse Simpson index of each forager's
+;; successful visits over resources (how many resources it actually uses).
+to-report visit-diet
+  let fs foragers with [ sum succ-visits > 0 ]
+  if not any? fs [ report 0 ]
+  report mean [ 1 / sum map [ x -> (x / sum succ-visits) ^ 2 ] succ-visits ] of fs
+end
+
+;; Weighted bipartite network of successful visits: "forager:resource:count;..."
+to-report web-edgelist
+  let parts []
+  foreach sort foragers [ f ->
+    ask f [
+      let i 0
+      foreach succ-visits [ n ->
+        if n > 0 [ set parts lput (word who ":" i ":" n) parts ]
+        set i i + 1
+      ]
+    ]
+  ]
+  report join-records parts
+end
+
+;; v0.4 (M4) — development reporters.
+to-report skill-gain                       ; mean skill now − at setup
+  report mean-skill - mean-skill-0
+end
+
+to-report share-in-band                    ; visits with d inside the ZPD band
+  report safe-div band-visits total-visits
+end
+
+to-report share-too-easy                   ; visits with d below the band
+  report safe-div easy-visits total-visits
+end
+
+;; Skill change per forager: "id:skill0:skill;..."
+to-report forager-skills
+  report join-records map [ f -> [ (word who ":" (precision skill-0 4) ":"
+                                         (precision skill 4)) ] of f ]
+                          sort foragers
+end
+
+;; All successful visits in time order: "tick:forager:resource;..."
+;; (used in R to build networks in time windows, H8).
+to-report visit-sequence
+  report join-records visit-records
+end
+
+;; v0.5 (M5a) — renewal reporters.
+to-report share-renewed                    ; slots renewed at least once
+  report (count resources with [ generation > 0 ]) / num-resources
+end
+
+to-report mean-complexity                  ; all resources, end of run
+  report mean [complexity] of resources
+end
+
+to-report mean-complexity-alive            ; living resources only
+  ifelse any? resources with [ alive? ]
+    [ report mean [complexity] of resources with [ alive? ] ]
+    [ report 0 ]
+end
+
+to-report skill-complexity-gap             ; mean skill of active foragers −
+  let fa foragers with [ active? ]         ; mean eff. complexity of living resources
+  let ra resources with [ alive? ]
+  if not any? fa or not any? ra [ report 0 ]
+  report mean [skill] of fa - mean [eff-complexity] of ra
+end
+
+;; All renewals: "tick:resource:parent:author:old-c:new-c;..." (−1 = none)
+to-report renewal-list
+  report join-records renewal-records
+end
+
+;; Forager attributes: "id:skill:activity:cheater:active;..."
+to-report forager-traits
+  report join-records map [ f -> [ (word who ":" (precision skill 4) ":"
+                                         (precision activity 4) ":"
+                                         (ifelse-value cheater? [ 1 ] [ 0 ]) ":"
+                                         (ifelse-value active? [ 1 ] [ 0 ])) ] of f ]
+                          sort foragers
+end
+
+;; Resource attributes: "id:cluster:complexity:x:y:quality:vitality;..."
+to-report resource-traits
+  report join-records map [ r -> [ (word res-index ":" cluster-id ":"
+                                         (precision complexity 4) ":"
+                                         (precision xcor 2) ":" (precision ycor 2) ":"
+                                         (precision quality 4) ":"
+                                         (precision vitality 4)) ] of r ]
+                          sort resources
+end
+
+to-report join-records [ parts ]
+  if empty? parts [ report "" ]
+  report reduce [ [a b] -> (word a ";" b) ] parts
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; VISUALS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+to style-resource  ; resource procedure
+  set color ifelse-value alive? [ item (cluster-id mod 14) base-colors ] [ grey ]
+  set size 0.8 + vitality
+end
+
+to style-forager  ; forager procedure
+  ifelse active? [
+    set color ifelse-value world-type = "meadow"
+      [ scale-color yellow skill -0.2 1.2 ]
+      [ scale-color blue skill -0.2 1.2 ]
+  ] [
+    set color grey + 2
+  ]
+end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; UTILITIES
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Beta(a, b) via two Gamma draws.
+to-report random-beta [ a b ]
+  let x random-gamma a 1
+  let y random-gamma b 1
+  report x / (x + y)
+end
+
+to-report clip [ x lo hi ]
+  report max list lo (min list hi x)
+end
+
+to-report clamp-x [ x ]
+  report clip x min-pxcor max-pxcor
+end
+
+to-report clamp-y [ y ]
+  report clip y min-pycor max-pycor
+end
+
+to-report safe-div [ a b ]
+  report ifelse-value b > 0 [ a / b ] [ 0 ]
+end]]></code>
+  <widgets>
+    <view x="430" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-20" height="451" showTickCounter="true" patchSize="11.0" fontSize="10" wrappingAllowedY="false" width="451" tickCounterLabel="ticks" maxPycor="20" updateMode="1" maxPxcor="20" minPxcor="-20"></view>
+    <button x="10" y="10" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="95" display="setup">setup</button>
+    <button x="110" y="10" height="35" disableUntilTicks="true" forever="true" kind="Observer" width="95" display="go">go</button>
+    <button x="210" y="10" height="35" disableUntilTicks="true" forever="false" kind="Observer" width="95" display="go-once">go</button>
+    <chooser x="5" y="50" height="60" variable="world-type" current="1" width="200" display="world-type">
+      <choice type="string" value="meadow"></choice>
+      <choice type="string" value="wiki"></choice>
+    </chooser>
+    <monitor x="430" precision="3" y="470" height="60" fontSize="11" width="145" display="active foragers">share-active-foragers</monitor>
+    <monitor x="580" precision="3" y="470" height="60" fontSize="11" width="145" display="alive resources">share-alive-resources</monitor>
+    <plot x="895" autoPlotX="true" yMax="1.0" autoPlotY="false" yAxis="share" y="10" xMin="0.0" height="180" legend="true" xMax="150.0" yMin="0.0" width="420" xAxis="ticks" display="Guild state">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="active foragers" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot share-active-foragers</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="alive resources" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot share-alive-resources</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mean energy" color="-955883" legend="true">
+        <setup></setup>
+        <update>plot mean-energy</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mean quality" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot mean-quality</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="mean skill" color="-5207188" legend="true">
+        <setup></setup>
+        <update>plot mean-skill</update>
+      </pen>
+    </plot>
+    <plot x="895" autoPlotX="true" yMax="1.0" autoPlotY="false" yAxis="rate" y="195" xMin="0.0" height="180" legend="true" xMax="150.0" yMin="0.0" width="420" xAxis="ticks" display="Visit outcomes">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="fail rate" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot fail-rate</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="service rate" color="-13840069" legend="true">
+        <setup></setup>
+        <update>plot service-rate</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="cross-cluster" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot cross-cluster-share</update>
+      </pen>
+    </plot>
+    <plot x="895" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="unique links" y="380" xMin="0.0" height="180" legend="true" xMax="150.0" yMin="0.0" width="420" xAxis="ticks" display="Link accumulation (E0)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="unique links" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot unique-links</update>
+      </pen>
+    </plot>
+    <switch x="5" y="115" height="40" on="true" variable="trait-matching?" width="200" display="trait-matching?"></switch>
+    <switch x="5" y="155" height="40" on="true" variable="feedback?" width="200" display="feedback?"></switch>
+    <switch x="5" y="195" height="40" on="true" variable="adaptive-foraging?" width="200" display="adaptive-foraging?"></switch>
+    <switch x="5" y="230" height="40" on="true" variable="trait-development?" width="200" display="trait-development?"></switch>
+    <switch x="5" y="265" height="40" on="true" variable="renewal?" width="200" display="renewal?"></switch>
+    <slider x="220" step="1" y="50" max="100" width="200" display="num-foragers" height="50" min="5" direction="Horizontal" default="30.0" variable="num-foragers"></slider>
+    <slider x="215" step="1" y="105" max="200" width="200" display="num-resources" height="50" min="10" direction="Horizontal" default="98.0" variable="num-resources"></slider>
+    <slider x="215" step="1" y="160" max="10" width="200" display="cluster-count" height="50" min="1" direction="Horizontal" default="6.0" variable="cluster-count"></slider>
+    <slider x="215" step="0.5" y="215" max="8" width="200" display="cluster-spread" height="50" min="0.5" direction="Horizontal" default="3.0" variable="cluster-spread"></slider>
+    <slider x="215" step="0.5" y="270" max="20" width="200" display="perception-radius" height="50" min="1" direction="Horizontal" default="6.0" variable="perception-radius"></slider>
+    <slider x="215" step="0.01" y="325" max="0.5" width="200" display="visit-cost" height="50" min="0" direction="Horizontal" default="0.05" variable="visit-cost"></slider>
+    <slider x="215" step="0.01" y="380" max="1" width="200" display="mutualism-strength" height="50" min="0" direction="Horizontal" default="0.45" variable="mutualism-strength"></slider>
+    <slider x="220" step="0.01" y="435" max="0.5" width="200" display="regeneration-rate" height="50" min="0" direction="Horizontal" default="0.2" variable="regeneration-rate"></slider>
+    <slider x="220" step="0.01" y="490" max="0.2" width="150" display="offspring-sd" height="50" min="0" direction="Horizontal" default="0.14" variable="offspring-sd"></slider>
+    <slider x="220" step="0.05" y="545" max="0.95" width="200" display="activity-mean" height="50" min="0.05" direction="Horizontal" default="0.3" variable="activity-mean"></slider>
+    <slider x="220" step="0.5" y="600" max="20" width="200" display="activity-concentration" height="50" min="0.5" direction="Horizontal" default="2.0" variable="activity-concentration"></slider>
+    <slider x="220" step="0.5" y="655" max="10" width="185" display="adaptation-rate" height="50" min="0" direction="Horizontal" default="5.0" variable="adaptation-rate"></slider>
+    <slider x="220" step="0.005" y="710" max="0.2" width="190" display="skill-growth" height="50" min="0" direction="Horizontal" default="0.115" variable="skill-growth"></slider>
+    <slider x="220" step="0.01" y="765" max="0.2" width="150" display="renewal-rate" height="50" min="0" direction="Horizontal" default="0.05" variable="renewal-rate"></slider>
+    <monitor x="730" precision="3" y="470" height="60" fontSize="11" width="145" display="fail rate">fail-rate</monitor>
+    <monitor x="440" precision="3" y="530" height="60" fontSize="11" width="120" display="too-easy share">share-too-easy</monitor>
+    <monitor x="580" precision="3" y="530" height="60" fontSize="11" width="145" display="mean skill">mean-skill</monitor>
+    <monitor x="730" precision="3" y="535" height="60" fontSize="11" width="145" display="unique links">unique-links</monitor>
+    <monitor x="440" precision="3" y="595" height="60" fontSize="11" width="100" display="mean quality">mean-quality</monitor>
+    <monitor x="575" precision="3" y="595" height="60" fontSize="11" width="150">skill-complexity-gap</monitor>
+    <monitor x="730" precision="3" y="595" height="60" fontSize="11" width="100" display="renewals">renewal-count</monitor>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+MUTUS (Mutualism in Texts and Understanding of Students) is a minimal agent-based model of a **mutualistic network between two guilds**. One computational core supports two worlds:
+ Meadow with pollinators (bumblebees), flowering plants,  proboscis length vs. corolla dept 
+or Wiki with students of a course, articles of a course wiki or glossary,  competence vs. conceptual difficulty (zone of proximal development
+
+
+
+The model asks which regularities of plant-pollinator networks transfer to collaborative text production, and which are changed by processes that are slow or absent in ecology: learning within the ZPD, scaffolding by text quality, and authoring of new texts by the learners themselves.
+
+MUTUS is built as a **ladder of six levels**. Each level adds one mechanism, and each mechanism has its own switch, so the contribution of every mechanism can be isolated in BehaviorSpace.
+
+## HOW IT WORKS
+
+Each tick, every active forager forages with probability equal to its activity:
+
+1. **Perceives** the resources within `perception-radius` (its landscape or its topical horizon).
+2. **Chooses** a partner by roulette. The weight is the forager's effort on the resource (M3) times the resource's vitality (M2); in M0вЂ“M1 the choice is neutral.
+3. **Matches traits** (M1). Let d = effective complexity в€’ skill. If d > zpd-above the resource is too hard and the visit fails. If d < в€’zpd-below it is too easy: the forager gains little and learns nothing. Otherwise the visit falls inside the ZPD band.
+4. **Consumes** reward (Holling type II; in the wiki, re-reading the same text yields less) and pays `visit-cost` in energy. Foragers with too little energy become dormant (in the wiki: drop out) and recover slowly.
+5. **Serves** the resource, with probability equal to its energy, using the pollen (concepts) carried from the previous successful visit (M2). Service raises the quality and vitality of the resource; transfer between clusters is weighted by the cross-cluster efficiency of the world.
+6. **Adapts** its effort towards rewarding partners (M3, replicator dynamics after Valdovinos et al. 2013).
+7. **Learns** (M4): inside the band, skill grows by `skill-growth` Г— novelty Г— position in the band Г— (1 в€’ skill). Learning is fastest at the upper edge of the ZPD.
+
+Then resources regenerate reward, fade without visits (vitality, and quality in the wiki) and update their effective complexity (scaffolding in the wiki). Faded resources can be **renewed** (M5a). In the meadow the newcomer is a seedling of a pollinated plant of the same cluster and inherits its complexity. In the wiki it is a new article written by a nearby active student at the upper edge of that student's ZPD.
+
+
+
+## HOW TO USE IT
+
+1. Choose `world-type` (meadow or wiki).
+2. Choose the level with the switches:
+ 
+Any combination of switches is valid. M4 needs M1 (without the ZPD band there is nothing to learn from), and M5a needs M2 (without feedback nothing fades).
+
+3. Press **setup**, then **go**. A run lasts 150 ticks (one season or one semester) and stops by itself.
+
+**Sliders:** `num-foragers`, `num-resources`, `cluster-count`, `cluster-spread`, `perception-radius`, `activity-mean`, `activity-concentration`, `visit-cost`, `mutualism-strength`, `regeneration-rate`, `adaptation-rate`, `skill-growth`, `renewal-rate`, `offspring-sd`.
+
+**View:** resources are flowers (meadow) or squares (wiki), coloured by cluster, sized by vitality, and grey when faded. Foragers are bugs (meadow) or persons (wiki), shaded by skill, and grey when dormant.
+
+**Monitors and plots** show active foragers, alive resources, failure and too-easy shares, mean skill and quality, distinct links, the skillвЂ“complexity gap and the number of renewals.
+
+**Experiments.** Six BehaviorSpace experiments (E0вЂ“E5) are included. All output is collected with BehaviorSpace reporters, one table per experiment, and analysed with the R script `MUTUS_analysis.R` (see the README of the release).
+
+## THINGS TO NOTICE
+
+- With trait matching on, a third of the visits fail at first. Watch how adaptive foraging and learning reduce failures.
+- With feedback on, some resources prosper and others fade: mutual benefit creates winners and losers.
+- With learning on, the share of **too-easy** visits grows over the semester: learners outgrow their resources.
+- With renewal on, compare the skillвЂ“complexity gap in the two worlds. In the wiki new articles follow the learners; in the meadow new flowers stay accessible.
+- Around tick 80 the share of alive resources drops suddenly. All resources start with the same vitality, so the ones nobody visits fade together.
+
+## THINGS TO TRY
+
+- Set `perception-radius` to 3 and then to 12. How do dropout and cross-cluster visits change in each world?
+- Raise `visit-cost`. Which world loses its foragers first?
+- Switch learning on and off with renewal on. When does the wiki keep its students at the frontier of the material?
+- Run M0 and M1 side by side: how much of the network structure does trait matching create?
+
+## EXTENDING THE MODEL
+
+- **M5b:** retire or rewrite resources that the learners have outgrown, not only those that have faded.
+- Random initial vitality, to remove the synchronous fading at tick в‰€ 80.
+- Recruitment and departure of foragers (students joining and leaving a course).
+- Calibration of the wiki world against edit histories of real course wikis.
+
+## NETLOGO FEATURES
+
+Two breeds (`foragers`, `resources`). The model avoids links: the bipartite visit network is accumulated in lists and reported as strings (`web-edgelist`, `visit-sequence`, `renewal-list`) for analysis in R. In BehaviorSpace the random seed is the run number, so every table is reproducible.
+
+## RELATED MODELS
+
+- STiMUS v2.1 and STiMUS-HAI v3.1 (CoMSES): stigmergicвЂ“mutualistic models of teamwork on shared digital artefacts; MUTUS descends from STiMUS.
+- Valdovinos et al. (2013, 2016): adaptive foraging in pollination networks.
+
+## CREDITS AND REFERENCES
+
+Author: Yevgeny Patarakin (Institute of Education, HSE University; Institute of Digital Education, Moscow City University).
+
+Full description: `MUTUS_ODD_v1.0.md` (ODD protocol, Grimm et al. 2020).
+
+- Bascompte, J., Jordano, P., MeliГЎn, C. J., & Olesen, J. M. (2003). The nested assembly of plantвЂ“animal mutualistic networks. PNAS, 100(16), 9383вЂ“9387. https://doi.org/10.1073/pnas.1633576100
+- Grimm, V., et al. (2020). The ODD protocol for describing agent-based and other simulation models: a second update. JASSS, 23(2), 7. https://www.jasss.org/23/2/7.html
+- Olesen, J. M., Bascompte, J., Dupont, Y. L., & Jordano, P. (2007). The modularity of pollination networks. PNAS, 104(50), 19891вЂ“19896. https://doi.org/10.1073/pnas.0706375104
+- St-Onge, J., et al. (2022). Socio-semantic networks as mutualistic networks. Scientific Reports, 12, 1889. https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8813919/
+- Valdovinos, F. S., et al. (2013). Adaptive foraging allows the maintenance of biodiversity of pollination networks. Oikos, 122, 907вЂ“917.
+- Vygotsky, L. S. (1978). Mind in Society. Harvard University Press.
+- Wilensky, U. (1999). NetLogo. Center for Connected Learning and Computer-Based Modeling, Northwestern University. https://ccl.northwestern.edu/netlogo/
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="binding site" rotatable="true" editableColorIndex="6">
+      <rectangle endX="75" startY="150" marked="true" color="751909887" endY="180" startX="0" filled="true"></rectangle>
+      <rectangle endX="180" startY="150" marked="true" color="751909887" endY="180" startX="120" filled="true"></rectangle>
+      <rectangle endX="300" startY="150" marked="true" color="751909887" endY="180" startX="225" filled="true"></rectangle>
+      <rectangle endX="300" startY="180" marked="true" color="751909887" endY="195" startX="0" filled="true"></rectangle>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dna 1" rotatable="false" editableColorIndex="15">
+      <rectangle endX="60" startY="150" marked="false" color="1504722175" endY="173" startX="0" filled="true"></rectangle>
+      <rectangle endX="0" startY="196" marked="false" color="878553599" endY="176" startX="60" filled="true"></rectangle>
+      <rectangle endX="298" startY="150" marked="false" color="878553599" endY="173" startX="238" filled="true"></rectangle>
+      <rectangle endX="60" startY="172" marked="false" color="1422181631" endY="195" startX="0" filled="true"></rectangle>
+      <rectangle endX="121" startY="150" marked="false" color="496990463" endY="173" startX="61" filled="true"></rectangle>
+      <rectangle endX="121" startY="172" marked="false" color="878553599" endY="195" startX="61" filled="true"></rectangle>
+      <rectangle endX="182" startY="150" marked="false" color="878553599" endY="173" startX="122" filled="true"></rectangle>
+      <rectangle endX="182" startY="172" marked="false" color="496990463" endY="195" startX="122" filled="true"></rectangle>
+      <rectangle endX="241" startY="172" marked="false" color="1504722175" endY="195" startX="181" filled="true"></rectangle>
+      <rectangle endX="302" startY="172" marked="false" color="496990463" endY="195" startX="242" filled="true"></rectangle>
+      <rectangle endX="240" startY="150" marked="false" color="1422181631" endY="173" startX="180" filled="true"></rectangle>
+    </shape>
+    <shape name="dna 2" rotatable="false" editableColorIndex="15">
+      <rectangle endX="60" startY="150" marked="false" color="1422181631" endY="173" startX="0" filled="true"></rectangle>
+      <rectangle endX="0" startY="196" marked="false" color="878553599" endY="176" startX="60" filled="true"></rectangle>
+      <rectangle endX="298" startY="150" marked="false" color="878553599" endY="173" startX="238" filled="true"></rectangle>
+      <rectangle endX="60" startY="172" marked="false" color="1504722175" endY="195" startX="0" filled="true"></rectangle>
+      <rectangle endX="121" startY="150" marked="false" color="1422181631" endY="173" startX="61" filled="true"></rectangle>
+      <rectangle endX="121" startY="172" marked="false" color="1504722175" endY="195" startX="61" filled="true"></rectangle>
+      <rectangle endX="182" startY="150" marked="false" color="1504722175" endY="173" startX="122" filled="true"></rectangle>
+      <rectangle endX="182" startY="172" marked="false" color="878553599" endY="195" startX="122" filled="true"></rectangle>
+      <rectangle endX="241" startY="172" marked="false" color="1504722175" endY="195" startX="181" filled="true"></rectangle>
+      <rectangle endX="302" startY="172" marked="false" color="496990463" endY="195" startX="242" filled="true"></rectangle>
+      <rectangle endX="240" startY="150" marked="false" color="1422181631" endY="173" startX="180" filled="true"></rectangle>
+    </shape>
+    <shape name="dna 3" rotatable="false" editableColorIndex="15">
+      <rectangle endX="300" startY="150" marked="false" color="1422181631" endY="173" startX="240" filled="true"></rectangle>
+      <rectangle endX="240" startY="196" marked="false" color="878553599" endY="176" startX="300" filled="true"></rectangle>
+      <rectangle endX="59" startY="150" marked="false" color="878553599" endY="173" startX="-1" filled="true"></rectangle>
+      <rectangle endX="300" startY="172" marked="false" color="1504722175" endY="195" startX="240" filled="true"></rectangle>
+      <rectangle endX="239" startY="150" marked="false" color="1422181631" endY="173" startX="179" filled="true"></rectangle>
+      <rectangle endX="239" startY="172" marked="false" color="1504722175" endY="195" startX="179" filled="true"></rectangle>
+      <rectangle endX="178" startY="150" marked="false" color="1504722175" endY="173" startX="118" filled="true"></rectangle>
+      <rectangle endX="178" startY="172" marked="false" color="878553599" endY="195" startX="118" filled="true"></rectangle>
+      <rectangle endX="119" startY="172" marked="false" color="1504722175" endY="195" startX="59" filled="true"></rectangle>
+      <rectangle endX="58" startY="172" marked="false" color="496990463" endY="195" startX="-2" filled="true"></rectangle>
+      <rectangle endX="120" startY="150" marked="false" color="1422181631" endY="173" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="dna 4" rotatable="false" editableColorIndex="15">
+      <rectangle endX="300" startY="150" marked="false" color="1504722175" endY="173" startX="240" filled="true"></rectangle>
+      <rectangle endX="240" startY="196" marked="false" color="878553599" endY="176" startX="300" filled="true"></rectangle>
+      <rectangle endX="59" startY="150" marked="false" color="878553599" endY="173" startX="-1" filled="true"></rectangle>
+      <rectangle endX="300" startY="172" marked="false" color="1422181631" endY="195" startX="240" filled="true"></rectangle>
+      <rectangle endX="239" startY="150" marked="false" color="496990463" endY="173" startX="179" filled="true"></rectangle>
+      <rectangle endX="239" startY="172" marked="false" color="878553599" endY="195" startX="179" filled="true"></rectangle>
+      <rectangle endX="178" startY="150" marked="false" color="878553599" endY="173" startX="118" filled="true"></rectangle>
+      <rectangle endX="178" startY="172" marked="false" color="496990463" endY="195" startX="118" filled="true"></rectangle>
+      <rectangle endX="119" startY="172" marked="false" color="1504722175" endY="195" startX="59" filled="true"></rectangle>
+      <rectangle endX="58" startY="172" marked="false" color="496990463" endY="195" startX="-2" filled="true"></rectangle>
+      <rectangle endX="120" startY="150" marked="false" color="1422181631" endY="173" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="mrna" rotatable="true" editableColorIndex="2">
+      <circle x="219" y="114" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="189" y="129" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="159" y="114" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="39" y="114" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="69" y="129" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="98" y="144" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="129" y="129" marked="true" color="-244705793" diameter="42" filled="true"></circle>
+      <circle x="99" y="145" marked="false" color="255" diameter="40" filled="false"></circle>
+      <circle x="220" y="115" marked="false" color="255" diameter="40" filled="false"></circle>
+      <circle x="189" y="132" marked="false" color="255" diameter="40" filled="false"></circle>
+      <circle x="160" y="114" marked="false" color="255" diameter="40" filled="false"></circle>
+      <circle x="129" y="131" marked="false" color="255" diameter="40" filled="false"></circle>
+      <circle x="70" y="131" marked="false" color="255" diameter="40" filled="false"></circle>
+      <circle x="39" y="114" marked="false" color="255" diameter="40" filled="false"></circle>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true"></circle>
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true"></circle>
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120"></point>
+        <point x="240" y="165"></point>
+        <point x="255" y="165"></point>
+        <point x="278" y="120"></point>
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true"></circle>
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285"></point>
+        <point x="30" y="285"></point>
+        <point x="30" y="240"></point>
+        <point x="15" y="195"></point>
+        <point x="45" y="210"></point>
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true"></circle>
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true"></rectangle>
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285"></point>
+        <point x="210" y="285"></point>
+        <point x="210" y="240"></point>
+        <point x="240" y="210"></point>
+        <point x="195" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85"></point>
+        <point x="285" y="105"></point>
+        <point x="302" y="99"></point>
+        <point x="294" y="83"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85"></point>
+        <point x="210" y="105"></point>
+        <point x="193" y="99"></point>
+        <point x="201" y="83"></point>
+      </polygon>
+    </shape>
+    <shape name="signal" rotatable="false" editableColorIndex="6">
+      <circle x="30" y="60" marked="true" color="751909887" diameter="240" filled="true"></circle>
+      <rectangle endX="180" startY="150" marked="true" color="751909887" endY="180" startX="120" filled="true"></rectangle>
+      <rectangle endX="270" startY="45" marked="false" color="496990463" endY="150" startX="30" filled="true"></rectangle>
+      <rectangle endX="120" startY="150" marked="false" color="496990463" endY="180" startX="75" filled="true"></rectangle>
+      <rectangle endX="225" startY="150" marked="false" color="496990463" endY="180" startX="180" filled="true"></rectangle>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="transcription factor" rotatable="true" editableColorIndex="8">
+      <rectangle endX="120" startY="150" marked="true" color="1422181631" endY="180" startX="75" filled="true"></rectangle>
+      <rectangle endX="225" startY="150" marked="true" color="1422181631" endY="180" startX="180" filled="true"></rectangle>
+      <rectangle endX="225" startY="105" marked="true" color="1422181631" endY="150" startX="75" filled="true"></rectangle>
+      <circle x="88" y="13" marked="true" color="1422181631" diameter="124" filled="true"></circle>
+      <rectangle endX="120" startY="165" marked="false" color="255" endY="180" startX="75" filled="true"></rectangle>
+      <rectangle endX="225" startY="165" marked="false" color="255" endY="180" startX="180" filled="true"></rectangle>
+    </shape>
+    <shape name="transcription factor bound" rotatable="true" editableColorIndex="8">
+      <rectangle endX="120" startY="150" marked="false" color="255" endY="180" startX="75" filled="true"></rectangle>
+      <rectangle endX="225" startY="150" marked="false" color="255" endY="180" startX="180" filled="true"></rectangle>
+      <circle x="105" y="60" marked="true" color="1422181631" diameter="90" filled="true"></circle>
+      <rectangle endX="225" startY="120" marked="true" color="1422181631" endY="150" startX="75" filled="true"></rectangle>
+    </shape>
+    <shape name="transcription factor signal bound" rotatable="false" editableColorIndex="8">
+      <rectangle endX="120" startY="150" marked="false" color="255" endY="180" startX="75" filled="true"></rectangle>
+      <rectangle endX="225" startY="150" marked="false" color="255" endY="180" startX="180" filled="true"></rectangle>
+      <rectangle endX="210" startY="105" marked="true" color="1422181631" endY="150" startX="90" filled="true"></rectangle>
+      <circle x="129" y="84" marked="true" color="1422181631" diameter="42" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133"></point>
+        <point x="245" y="131"></point>
+        <point x="245" y="133"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194"></point>
+        <point x="13" y="197"></point>
+        <point x="30" y="191"></point>
+        <point x="38" y="193"></point>
+        <point x="38" y="205"></point>
+        <point x="20" y="226"></point>
+        <point x="20" y="257"></point>
+        <point x="27" y="265"></point>
+        <point x="38" y="266"></point>
+        <point x="40" y="260"></point>
+        <point x="31" y="253"></point>
+        <point x="31" y="230"></point>
+        <point x="60" y="206"></point>
+        <point x="68" y="198"></point>
+        <point x="75" y="209"></point>
+        <point x="66" y="228"></point>
+        <point x="65" y="243"></point>
+        <point x="82" y="261"></point>
+        <point x="84" y="268"></point>
+        <point x="100" y="267"></point>
+        <point x="103" y="261"></point>
+        <point x="77" y="239"></point>
+        <point x="79" y="231"></point>
+        <point x="100" y="207"></point>
+        <point x="98" y="196"></point>
+        <point x="119" y="201"></point>
+        <point x="143" y="202"></point>
+        <point x="160" y="195"></point>
+        <point x="166" y="210"></point>
+        <point x="172" y="213"></point>
+        <point x="173" y="238"></point>
+        <point x="167" y="251"></point>
+        <point x="160" y="248"></point>
+        <point x="154" y="265"></point>
+        <point x="169" y="264"></point>
+        <point x="178" y="247"></point>
+        <point x="186" y="240"></point>
+        <point x="198" y="260"></point>
+        <point x="200" y="271"></point>
+        <point x="217" y="271"></point>
+        <point x="219" y="262"></point>
+        <point x="207" y="258"></point>
+        <point x="195" y="230"></point>
+        <point x="192" y="198"></point>
+        <point x="210" y="184"></point>
+        <point x="227" y="164"></point>
+        <point x="242" y="144"></point>
+        <point x="259" y="145"></point>
+        <point x="284" y="151"></point>
+        <point x="277" y="141"></point>
+        <point x="293" y="140"></point>
+        <point x="299" y="134"></point>
+        <point x="297" y="127"></point>
+        <point x="273" y="119"></point>
+        <point x="270" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195"></point>
+        <point x="14" y="180"></point>
+        <point x="36" y="166"></point>
+        <point x="40" y="153"></point>
+        <point x="53" y="140"></point>
+        <point x="82" y="131"></point>
+        <point x="134" y="133"></point>
+        <point x="159" y="126"></point>
+        <point x="188" y="115"></point>
+        <point x="227" y="108"></point>
+        <point x="236" y="102"></point>
+        <point x="238" y="98"></point>
+        <point x="268" y="86"></point>
+        <point x="269" y="92"></point>
+        <point x="281" y="87"></point>
+        <point x="269" y="103"></point>
+        <point x="269" y="113"></point>
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="E0_demo" repetitions="10" sequentialRunOrder="true" runMetricsEveryStep="true">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>share-active-foragers</metric>
+        <metric>share-alive-resources</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-skill</metric>
+        <metric>fail-rate</metric>
+        <metric>share-too-easy</metric>
+        <metric>unique-links</metric>
+        <metric>skill-complexity-gap</metric>
+        <metric>renewal-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="world-type">
+          <value value="&quot;meadow&quot;"></value>
+          <value value="&quot;wiki&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="skill-growth">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perception-radius">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-matching?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="feedback?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptive-foraging?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-development?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-foragers">
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-resources">
+          <value value="98"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-count">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-spread">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-mean">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-concentration">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptation-rate">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="regeneration-rate">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-strength">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="visit-cost">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="offspring-sd">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E1_ladder" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>share-active-foragers</metric>
+        <metric>mean-energy</metric>
+        <metric>fail-rate</metric>
+        <metric>service-rate</metric>
+        <metric>mean-gain-per-visit</metric>
+        <metric>unique-links</metric>
+        <metric>connectance-obs</metric>
+        <metric>cross-cluster-share</metric>
+        <metric>mean-quality</metric>
+        <metric>share-alive-resources</metric>
+        <metric>effective-diet</metric>
+        <metric>visit-diet</metric>
+        <metric>mean-skill</metric>
+        <metric>skill-gain</metric>
+        <metric>share-in-band</metric>
+        <metric>share-too-easy</metric>
+        <metric>web-edgelist</metric>
+        <metric>forager-traits</metric>
+        <metric>resource-traits</metric>
+        <metric>forager-skills</metric>
+        <metric>renewal-count</metric>
+        <metric>share-renewed</metric>
+        <metric>mean-complexity</metric>
+        <metric>mean-complexity-alive</metric>
+        <metric>skill-complexity-gap</metric>
+        <metric>renewal-list</metric>
+        <metric>visit-sequence</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="world-type">
+          <value value="&quot;meadow&quot;"></value>
+          <value value="&quot;wiki&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-matching?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="feedback?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptive-foraging?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-development?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="skill-growth">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perception-radius">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-foragers">
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-resources">
+          <value value="98"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-count">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-spread">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-mean">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-concentration">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptation-rate">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="regeneration-rate">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-strength">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="visit-cost">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="offspring-sd">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E2_radius" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>share-active-foragers</metric>
+        <metric>mean-energy</metric>
+        <metric>fail-rate</metric>
+        <metric>service-rate</metric>
+        <metric>mean-gain-per-visit</metric>
+        <metric>unique-links</metric>
+        <metric>connectance-obs</metric>
+        <metric>cross-cluster-share</metric>
+        <metric>mean-quality</metric>
+        <metric>share-alive-resources</metric>
+        <metric>effective-diet</metric>
+        <metric>visit-diet</metric>
+        <metric>mean-skill</metric>
+        <metric>skill-gain</metric>
+        <metric>share-in-band</metric>
+        <metric>share-too-easy</metric>
+        <metric>web-edgelist</metric>
+        <metric>forager-traits</metric>
+        <metric>resource-traits</metric>
+        <metric>forager-skills</metric>
+        <metric>renewal-count</metric>
+        <metric>share-renewed</metric>
+        <metric>mean-complexity</metric>
+        <metric>mean-complexity-alive</metric>
+        <metric>skill-complexity-gap</metric>
+        <metric>renewal-list</metric>
+        <metric>visit-sequence</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="world-type">
+          <value value="&quot;meadow&quot;"></value>
+          <value value="&quot;wiki&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perception-radius">
+          <value value="3"></value>
+          <value value="4.5"></value>
+          <value value="6"></value>
+          <value value="7.5"></value>
+          <value value="9"></value>
+          <value value="10.5"></value>
+          <value value="12"></value>
+          <value value="15"></value>
+          <value value="18"></value>
+          <value value="20"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptive-foraging?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-matching?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="feedback?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-development?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="skill-growth">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-foragers">
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-resources">
+          <value value="98"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-count">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-spread">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-mean">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-concentration">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptation-rate">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="regeneration-rate">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-strength">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="visit-cost">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="offspring-sd">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E3_development" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>share-active-foragers</metric>
+        <metric>mean-energy</metric>
+        <metric>fail-rate</metric>
+        <metric>service-rate</metric>
+        <metric>mean-gain-per-visit</metric>
+        <metric>unique-links</metric>
+        <metric>connectance-obs</metric>
+        <metric>cross-cluster-share</metric>
+        <metric>mean-quality</metric>
+        <metric>share-alive-resources</metric>
+        <metric>effective-diet</metric>
+        <metric>visit-diet</metric>
+        <metric>mean-skill</metric>
+        <metric>skill-gain</metric>
+        <metric>share-in-band</metric>
+        <metric>share-too-easy</metric>
+        <metric>web-edgelist</metric>
+        <metric>forager-traits</metric>
+        <metric>resource-traits</metric>
+        <metric>forager-skills</metric>
+        <metric>renewal-count</metric>
+        <metric>share-renewed</metric>
+        <metric>mean-complexity</metric>
+        <metric>mean-complexity-alive</metric>
+        <metric>skill-complexity-gap</metric>
+        <metric>renewal-list</metric>
+        <metric>visit-sequence</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="world-type">
+          <value value="&quot;meadow&quot;"></value>
+          <value value="&quot;wiki&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="skill-growth">
+          <value value="0"></value>
+          <value value="0.01"></value>
+          <value value="0.02"></value>
+          <value value="0.04"></value>
+          <value value="0.08"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perception-radius">
+          <value value="3"></value>
+          <value value="6"></value>
+          <value value="12"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal?">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-matching?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="feedback?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptive-foraging?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-development?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-foragers">
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-resources">
+          <value value="98"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-count">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-spread">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-mean">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-concentration">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptation-rate">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="regeneration-rate">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-strength">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="visit-cost">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="offspring-sd">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E4_renewal" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>share-active-foragers</metric>
+        <metric>mean-energy</metric>
+        <metric>fail-rate</metric>
+        <metric>service-rate</metric>
+        <metric>mean-gain-per-visit</metric>
+        <metric>unique-links</metric>
+        <metric>connectance-obs</metric>
+        <metric>cross-cluster-share</metric>
+        <metric>mean-quality</metric>
+        <metric>share-alive-resources</metric>
+        <metric>effective-diet</metric>
+        <metric>visit-diet</metric>
+        <metric>mean-skill</metric>
+        <metric>skill-gain</metric>
+        <metric>share-in-band</metric>
+        <metric>share-too-easy</metric>
+        <metric>web-edgelist</metric>
+        <metric>forager-traits</metric>
+        <metric>resource-traits</metric>
+        <metric>forager-skills</metric>
+        <metric>renewal-count</metric>
+        <metric>share-renewed</metric>
+        <metric>mean-complexity</metric>
+        <metric>mean-complexity-alive</metric>
+        <metric>skill-complexity-gap</metric>
+        <metric>renewal-list</metric>
+        <metric>visit-sequence</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="world-type">
+          <value value="&quot;meadow&quot;"></value>
+          <value value="&quot;wiki&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal?">
+          <value value="false"></value>
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="skill-growth">
+          <value value="0"></value>
+          <value value="0.04"></value>
+          <value value="0.08"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perception-radius">
+          <value value="3"></value>
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-matching?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="feedback?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptive-foraging?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-development?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-foragers">
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-resources">
+          <value value="98"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-count">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-spread">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-mean">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-concentration">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptation-rate">
+          <value value="5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="regeneration-rate">
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-strength">
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="visit-cost">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="offspring-sd">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="E5_sensitivity" repetitions="5" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>share-active-foragers</metric>
+        <metric>share-alive-resources</metric>
+        <metric>mean-energy</metric>
+        <metric>mean-quality</metric>
+        <metric>mean-skill</metric>
+        <metric>skill-gain</metric>
+        <metric>fail-rate</metric>
+        <metric>service-rate</metric>
+        <metric>share-in-band</metric>
+        <metric>share-too-easy</metric>
+        <metric>cross-cluster-share</metric>
+        <metric>mean-gain-per-visit</metric>
+        <metric>unique-links</metric>
+        <metric>connectance-obs</metric>
+        <metric>effective-diet</metric>
+        <metric>visit-diet</metric>
+        <metric>renewal-count</metric>
+        <metric>share-renewed</metric>
+        <metric>mean-complexity</metric>
+        <metric>mean-complexity-alive</metric>
+        <metric>skill-complexity-gap</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="world-type">
+          <value value="&quot;meadow&quot;"></value>
+          <value value="&quot;wiki&quot;"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="mutualism-strength">
+          <value value="0.05"></value>
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="regeneration-rate">
+          <value value="0.1"></value>
+          <value value="0.2"></value>
+          <value value="0.4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptation-rate">
+          <value value="2"></value>
+          <value value="5"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="visit-cost">
+          <value value="0.025"></value>
+          <value value="0.05"></value>
+          <value value="0.1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-mean">
+          <value value="0.2"></value>
+          <value value="0.3"></value>
+          <value value="0.4"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="skill-growth">
+          <value value="0.02"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="perception-radius">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-matching?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="feedback?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="adaptive-foraging?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="trait-development?">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-foragers">
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="num-resources">
+          <value value="98"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-count">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="cluster-spread">
+          <value value="3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="activity-concentration">
+          <value value="2"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="renewal-rate">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="offspring-sd">
+          <value value="0.05"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>

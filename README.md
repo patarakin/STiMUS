@@ -1,4 +1,4 @@
-# STiMUS / STiMUS-HAI
+# STiMUS / STiMUS-HAI / MUTUS
 
 Data, extraction/analysis scripts, and NetLogo agent-based models supporting:
 
@@ -11,6 +11,10 @@ is intended to make the empirical extraction pipeline, the resulting datasets,
 the analysis script, and both agent-based models (human-only and human-AI)
 independently reproducible. It is also the deposit basis for the corresponding
 [CoMSES Network](https://www.comses.net/) model library entries.
+
+The repository also hosts MUTUS, a related theoretical model of mutualistic
+networks in two worlds: a meadow and a course wiki. Unlike the models supporting
+the paper above, MUTUS is not calibrated against the Scratch wiki datasets.
 
 ## Repository structure
 
@@ -37,10 +41,13 @@ STiMUS/
 ├── models/
 │   ├── STiMUS_v2.1/          Human-only stigmergic-mutualistic ABM (NetLogo).
 │   │                         ODD protocol + CoMSES deposit notes + STiMUS_v2.1.nlogox
-│   └── STiMUS-HAI_v3.1/      Human-AI extension: STiMUS-HAI_v3.1.nlogox
+│   ├── STiMUS-HAI_v3.1/      Human-AI extension: STiMUS-HAI_v3.1.nlogox
 │                             (ai-agents), ai-share / judgment-share sliders,
 │                             ai-trust mechanic. CoMSES deposit notes.
-│                           
+│   └── MUTUS_v1/            Mutualistic-network ABM: meadow and course wiki.
+│       ├── MUTUS_v1.0.nlogox
+│       ├── COMSES_deposit.md
+│       └── MUTUS_ODD_v1.0.md
 │
 └── README.md                 This file.
 ```
@@ -88,13 +95,26 @@ See each model's `COMSES_deposit.md` for parameters, experiments, and version
 history. `STiMUS-HAI_v3.1` is backward-compatible with `STiMUS_v2.1`: setting
 `ai-share = 0` reproduces the human-only model's behavior.
 
+`MUTUS_v1` contains MUTUS v1.0, a NetLogo 7 model with six embedded BehaviorSpace
+experiments. Its mechanism ladder (M0–M5a) comprises neutral activity, trait
+matching, mutualistic feedback, adaptive foraging, learning, and resource renewal.
+Open `models/MUTUS_v1/MUTUS_v1.0.nlogox` in NetLogo, choose the world and switches,
+then press `setup` and `go`. The ODD protocol and CoMSES deposit notes accompany
+the model. No separate R scripts, datasets, or figures are included in this folder.
+
 ## Citation
 
 If you use this data or these models, please cite the paper above and, for the
 models specifically, the corresponding CoMSES Network deposit (DOI to be
 assigned on deposit; placeholder to be updated on publication).
 
+For MUTUS, use its corresponding CoMSES deposit when available; the paper above
+should not be treated as a publication reporting MUTUS results.
+
 ## License
 
 Data: [CC-BY-4.0]
 Code: [MIT]
+
+For model-specific licensing, consult the corresponding `COMSES_deposit.md`;
+the repository-level labels above do not replace an explicitly stated model license.
